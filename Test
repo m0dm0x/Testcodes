@@ -30,11 +30,23 @@ def write_to_file(output_path, content, append=False):
     with open(output_path, mode) as file:
         file.write(content + "\n")
 
+# Check if the table already exists in the job.conf and platform_conf.json
+def table_exists_in_file(file_path, table_name):
+    if os.path.exists(file_path):
+        with open(file_path, "r") as file:
+            content = file.read()
+            return f'"{table_name}"' in content  # Check for table name in the file
+    return False
+
 # Generate files for each table
 def generate_files(input_csv, output_dir, templates_dir):
     table_data = parse_input_csv(input_csv)
     
     for table_name, columns in table_data.items():
+        # Create a separate folder for each table
+        table_dir = os.path.join(output_dir, table_name)
+        os.makedirs(table_dir, exist_ok=True)
+        
         column_list = ",".join(columns)
         column_list_avro = ",\n".join(
             [
@@ -48,38 +60,42 @@ def generate_files(input_csv, output_dir, templates_dir):
         with open(sql_template_path, "r") as file:
             sql_template = file.read()
         sql_content = replace_placeholders(sql_template, {"$columns": column_list})
-        write_to_file(os.path.join(output_dir, f"{table_name}_Validation.sql"), sql_content)
+        write_to_file(os.path.join(table_dir, f"{table_name}_Validation.sql"), sql_content)
 
         # Generate HQL File
         hql_template_path = os.path.join(templates_dir, "hql_temp.hql")
         with open(hql_template_path, "r") as file:
             hql_template = file.read()
         hql_content = replace_placeholders(hql_template, {"$columns": column_list})
-        write_to_file(os.path.join(output_dir, f"{table_name}.hql"), hql_content)
+        write_to_file(os.path.join(table_dir, f"{table_name}.hql"), hql_content)
 
         # Generate AVRO File
         avro_template_path = os.path.join(templates_dir, "avro_temp.avsc")
         with open(avro_template_path, "r") as file:
             avro_template = file.read()
         avro_content = replace_placeholders(avro_template, {"$columns_avro": column_list_avro})
-        write_to_file(os.path.join(output_dir, f"{table_name}.avsc"), avro_content)
+        write_to_file(os.path.join(table_dir, f"{table_name}.avsc"), avro_content)
 
-        # Append to Job.conf
-        job_template_path = os.path.join(templates_dir, "job_temp.conf")
-        with open(job_template_path, "r") as file:
-            job_template = file.read()
-        job_content = replace_placeholders(
-            job_template,
-            {"$table_name": table_name, "$columns": column_list},
-        )
-        write_to_file(os.path.join(output_dir, "job.conf"), job_content, append=True)
+        # Append to Job.conf (if not already added)
+        job_file_path = os.path.join(output_dir, "job.conf")
+        if not table_exists_in_file(job_file_path, table_name):
+            job_template_path = os.path.join(templates_dir, "job_temp.conf")
+            with open(job_template_path, "r") as file:
+                job_template = file.read()
+            job_content = replace_placeholders(
+                job_template,
+                {"$table_name": table_name, "$columns": column_list},
+            )
+            write_to_file(job_file_path, job_content, append=True)
 
-        # Append to Platform_conf.json
-        platform_template_path = os.path.join(templates_dir, "platform_temp.json")
-        with open(platform_template_path, "r") as file:
-            platform_template = file.read()
-        platform_content = replace_placeholders(platform_template, {"$table_name": table_name})
-        write_to_file(os.path.join(output_dir, "platform_conf.json"), platform_content, append=True)
+        # Append to Platform_conf.json (if not already added)
+        platform_file_path = os.path.join(output_dir, "platform_conf.json")
+        if not table_exists_in_file(platform_file_path, table_name):
+            platform_template_path = os.path.join(templates_dir, "platform_temp.json")
+            with open(platform_template_path, "r") as file:
+                platform_template = file.read()
+            platform_content = replace_placeholders(platform_template, {"$table_name": table_name})
+            write_to_file(platform_file_path, platform_content, append=True)
 
     print("Files generated successfully!")
 
