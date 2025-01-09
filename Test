@@ -1,36 +1,35 @@
-import os
 from string import Template
+import os
 
-# Function to load a template and replace placeholders
 def generate_from_template(template_path, output_path, replacements):
+    """Reads a template, replaces placeholders, and writes the result to the output file."""
     with open(template_path, 'r') as template_file:
-        template_content = Template(template_file.read())
-        final_content = template_content.safe_substitute(replacements)
+        template_content = Template(template_file.read())  # Use string.Template for placeholders
+        final_content = template_content.safe_substitute(replacements)  # Replace placeholders
     
     with open(output_path, 'w') as output_file:
         output_file.write(final_content)
 
-# Main function to generate all files
 def create_files(tab_name, columns):
+    """Generates files using templates."""
     output_dir = os.path.join("C:\\Users\\sxp910\\Desktop\\tables\\Ingestion", tab_name)
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Prepare column list for SQL/HQL
+
+    # Prepare replacement strings
     columns_sql = ",\n".join(columns)
     columns_hql = ",\n".join([f"{col} string" for col in columns])
     columns_avro = ",\n".join(
         [f'{{ "name": "{col}", "type": ["null", "string"], "default": null }}' for col in columns]
     )
 
-    # Define replacements
     replacements = {
-        "$table_name": tab_name,
-        "$columns": columns_sql,
-        "$columns_hql": columns_hql,
-        "$columns_avro": columns_avro,
+        "columns": columns_sql,       # Replace $columns in templates
+        "columns_hql": columns_hql,   # Replace $columns_hql in HQL template
+        "table_name": tab_name,       # Replace $table_name in templates
+        "columns_avro": columns_avro  # Replace $columns_avro in AVRO template
     }
 
-    # Paths to templates
+    # Define template paths
     templates = {
         "sql": "templates/sql_temp.sql",
         "hql": "templates/hql_temp.hql",
@@ -39,7 +38,7 @@ def create_files(tab_name, columns):
         "platform": "templates/platform_temp.json"
     }
 
-    # Paths to outputs
+    # Define output paths
     outputs = {
         "sql": os.path.join(output_dir, f"{tab_name}_Validation.sql"),
         "hql": os.path.join(output_dir, f"{tab_name}.hql"),
@@ -48,13 +47,16 @@ def create_files(tab_name, columns):
         "platform": os.path.join(output_dir, "platform_conf.json")
     }
 
-    # Generate files
+    # Generate files from templates
     for file_type, template_path in templates.items():
-        generate_from_template(template_path, outputs[file_type], replacements)
+        if os.path.exists(template_path):
+            generate_from_template(template_path, outputs[file_type], replacements)
+        else:
+            print(f"Template file {template_path} not found. Skipping {file_type} generation.")
 
-    print("\nAll files have been created successfully!\n")
+    print("\nFiles have been generated successfully!\n")
 
-# Read input file and process
+# Read input data
 with open("input.txt", 'r') as input_file:
     tab_name = input_file.readline().strip()
     columns = [
@@ -62,5 +64,5 @@ with open("input.txt", 'r') as input_file:
         for col in input_file
     ]
 
-# Create files using the new method
+# Generate the files
 create_files(tab_name, columns)
