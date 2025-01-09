@@ -1,1 +1,66 @@
-mycode
+import os
+from string import Template
+
+# Function to load a template and replace placeholders
+def generate_from_template(template_path, output_path, replacements):
+    with open(template_path, 'r') as template_file:
+        template_content = Template(template_file.read())
+        final_content = template_content.safe_substitute(replacements)
+    
+    with open(output_path, 'w') as output_file:
+        output_file.write(final_content)
+
+# Main function to generate all files
+def create_files(tab_name, columns):
+    output_dir = os.path.join("C:\\Users\\sxp910\\Desktop\\tables\\Ingestion", tab_name)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Prepare column list for SQL/HQL
+    columns_sql = ",\n".join(columns)
+    columns_hql = ",\n".join([f"{col} string" for col in columns])
+    columns_avro = ",\n".join(
+        [f'{{ "name": "{col}", "type": ["null", "string"], "default": null }}' for col in columns]
+    )
+
+    # Define replacements
+    replacements = {
+        "$table_name": tab_name,
+        "$columns": columns_sql,
+        "$columns_hql": columns_hql,
+        "$columns_avro": columns_avro,
+    }
+
+    # Paths to templates
+    templates = {
+        "sql": "templates/sql_temp.sql",
+        "hql": "templates/hql_temp.hql",
+        "avro": "templates/avro_temp.avsc",
+        "jobs": "templates/jobs_temp.conf",
+        "platform": "templates/platform_temp.json"
+    }
+
+    # Paths to outputs
+    outputs = {
+        "sql": os.path.join(output_dir, f"{tab_name}_Validation.sql"),
+        "hql": os.path.join(output_dir, f"{tab_name}.hql"),
+        "avro": os.path.join(output_dir, f"{tab_name}.avsc"),
+        "jobs": os.path.join(output_dir, "jobs.conf"),
+        "platform": os.path.join(output_dir, "platform_conf.json")
+    }
+
+    # Generate files
+    for file_type, template_path in templates.items():
+        generate_from_template(template_path, outputs[file_type], replacements)
+
+    print("\nAll files have been created successfully!\n")
+
+# Read input file and process
+with open("input.txt", 'r') as input_file:
+    tab_name = input_file.readline().strip()
+    columns = [
+        col[col.find(':') + 1:col.find('>')].strip() if ':' in col and '>' in col else col.strip()
+        for col in input_file
+    ]
+
+# Create files using the new method
+create_files(tab_name, columns)
