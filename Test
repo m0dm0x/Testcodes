@@ -1,73 +1,79 @@
+import csv
 import os
-from string import Template
 
-# Function to append data to a configuration file
-def append_to_file(template_path, output_path, replacements):
-    """Appends data to the configuration file using a template."""
-    with open(template_path, 'r') as template_file:
-        template_content = Template(template_file.read())  # Use Template for placeholders
-        final_content = template_content.safe_substitute(replacements)  # Replace placeholders
+# Read input.csv
+def parse_input_csv(file_path):
+    with open(file_path, "r") as csv_file:
+        reader = csv.reader(csv_file)
+        headers = next(reader)  # First row contains table names
+        columns = list(reader)  # Remaining rows contain columns
+    table_data = {table: [row[i] for row in columns if row[i]] for i, table in enumerate(headers)}
+    return table_data
+
+# Replace placeholders in templates
+def replace_placeholders(template_content, replacements):
+    for placeholder, value in replacements.items():
+        template_content = template_content.replace(placeholder, value)
+    return template_content
+
+# Write generated content to a file
+def write_to_file(output_path, content, append=False):
+    mode = "a" if append else "w"
+    with open(output_path, mode) as file:
+        file.write(content + "\n")
+
+# Generate files for each table
+def generate_files(input_csv, output_dir, templates_dir):
+    table_data = parse_input_csv(input_csv)
     
-    with open(output_path, 'a') as output_file:  # Open in append mode
-        output_file.write(final_content + '\n')  # Add newline after each entry
+    for table_name, columns in table_data.items():
+        column_list = ",".join(columns)
+        column_list_avro = ",\n".join(
+            [
+                f'{{"name": "{col}", "type": ["null", "string"], "default": null, "columnName": "{col}", "sqlType": "12"}}'
+                for col in columns
+            ]
+        )
 
-# Main function to handle file generation
-def create_files(tab_name, columns):
-    """Generates files for SQL, HQL, AVRO, and appends to jobs.conf and platform_conf.json."""
-    output_dir = os.path.join("C:\\Users\\sxp910\\Desktop\\tables\\Ingestion", tab_name)
-    os.makedirs(output_dir, exist_ok=True)
+        # Generate SQL File
+        sql_template_path = os.path.join(templates_dir, "sql_temp.sql")
+        with open(sql_template_path, "r") as file:
+            sql_template = file.read()
+        sql_content = replace_placeholders(sql_template, {"$columns": column_list})
+        write_to_file(os.path.join(output_dir, f"{table_name}_Validation.sql"), sql_content)
 
-    # Prepare replacements
-    columns_sql = ",\n".join(columns)
-    columns_hql = ",\n".join([f"{col} string" for col in columns])
-    columns_avro = ",\n".join(
-        [f'{{ "name": "{col}", "type": ["null", "string"], "default": null }}' for col in columns]
-    )
+        # Generate HQL File
+        hql_template_path = os.path.join(templates_dir, "hql_temp.hql")
+        with open(hql_template_path, "r") as file:
+            hql_template = file.read()
+        hql_content = replace_placeholders(hql_template, {"$columns": column_list})
+        write_to_file(os.path.join(output_dir, f"{table_name}.hql"), hql_content)
 
-    replacements = {
-        "table_name": tab_name,
-        "columns": columns_sql,
-        "columns_hql": columns_hql,
-        "columns_avro": columns_avro,
-    }
+        # Generate AVRO File
+        avro_template_path = os.path.join(templates_dir, "avro_temp.avsc")
+        with open(avro_template_path, "r") as file:
+            avro_template = file.read()
+        avro_content = replace_placeholders(avro_template, {"$columns_avro": column_list_avro})
+        write_to_file(os.path.join(output_dir, f"{table_name}.avsc"), avro_content)
 
-    # Template paths
-    templates = {
-        "sql": "templates/sql_temp.sql",
-        "hql": "templates/hql_temp.hql",
-        "avro": "templates/avro_temp.avsc",
-        "jobs": "templates/jobs_temp.conf",
-        "platform": "templates/platform_temp.json"
-    }
+        # Append to Job.conf
+        job_template_path = os.path.join(templates_dir, "job_temp.conf")
+        with open(job_template_path, "r") as file:
+            job_template = file.read()
+        job_content = replace_placeholders(
+            job_template,
+            {"$table_name": table_name, "$columns": column_list},
+        )
+        write_to_file(os.path.join(output_dir, "job.conf"), job_content, append=True)
 
-    # Output paths
-    outputs = {
-        "sql": os.path.join(output_dir, f"{tab_name}_Validation.sql"),
-        "hql": os.path.join(output_dir, f"{tab_name}.hql"),
-        "avro": os.path.join(output_dir, f"{tab_name}.avsc"),
-        "jobs": "C:\\Users\\sxp910\\Desktop\\tables\\Ingestion\\jobs.conf",  # Append globally
-        "platform": "C:\\Users\\sxp910\\Desktop\\tables\\Ingestion\\platform_conf.json"  # Append globally
-    }
+        # Append to Platform_conf.json
+        platform_template_path = os.path.join(templates_dir, "platform_temp.json")
+        with open(platform_template_path, "r") as file:
+            platform_template = file.read()
+        platform_content = replace_placeholders(platform_template, {"$table_name": table_name})
+        write_to_file(os.path.join(output_dir, "platform_conf.json"), platform_content, append=True)
 
-    # Generate individual files
-    for file_type in ["sql", "hql", "avro"]:
-        if os.path.exists(templates[file_type]):
-            with open(templates[file_type], 'r') as template_file:
-                content = Template(template_file.read()).safe_substitute(replacements)
-            with open(outputs[file_type], 'w') as output_file:
-                output_file.write(content)
+    print("Files generated successfully!")
 
-    # Append to jobs.conf
-    append_to_file(templates["jobs"], outputs["jobs"], replacements)
-
-    # Append to platform_conf.json
-    append_to_file(templates["platform"], outputs["platform"], replacements)
-
-    print(f"Files for table {tab_name} have been generated and appended successfully!")
-
-# Read input and process multiple tables
-with open("input.txt", 'r') as input_file:
-    for line in input_file:
-        tab_name = line.strip()  # Assuming one table name per line
-        columns = ["id", "name", "age"]  # Replace with actual column parsing logic
-        create_files(tab_name, columns)
+# Main execution
+input_csv_path = "
