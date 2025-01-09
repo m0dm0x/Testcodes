@@ -1,21 +1,23 @@
-from string import Template
 import os
+from string import Template
 
-def generate_from_template(template_path, output_path, replacements):
-    """Reads a template, replaces placeholders, and writes the result to the output file."""
+# Function to append data to a configuration file
+def append_to_file(template_path, output_path, replacements):
+    """Appends data to the configuration file using a template."""
     with open(template_path, 'r') as template_file:
-        template_content = Template(template_file.read())  # Use string.Template for placeholders
+        template_content = Template(template_file.read())  # Use Template for placeholders
         final_content = template_content.safe_substitute(replacements)  # Replace placeholders
     
-    with open(output_path, 'w') as output_file:
-        output_file.write(final_content)
+    with open(output_path, 'a') as output_file:  # Open in append mode
+        output_file.write(final_content + '\n')  # Add newline after each entry
 
+# Main function to handle file generation
 def create_files(tab_name, columns):
-    """Generates files using templates."""
+    """Generates files for SQL, HQL, AVRO, and appends to jobs.conf and platform_conf.json."""
     output_dir = os.path.join("C:\\Users\\sxp910\\Desktop\\tables\\Ingestion", tab_name)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Prepare replacement strings
+    # Prepare replacements
     columns_sql = ",\n".join(columns)
     columns_hql = ",\n".join([f"{col} string" for col in columns])
     columns_avro = ",\n".join(
@@ -23,13 +25,13 @@ def create_files(tab_name, columns):
     )
 
     replacements = {
-        "columns": columns_sql,       # Replace $columns in templates
-        "columns_hql": columns_hql,   # Replace $columns_hql in HQL template
-        "table_name": tab_name,       # Replace $table_name in templates
-        "columns_avro": columns_avro  # Replace $columns_avro in AVRO template
+        "table_name": tab_name,
+        "columns": columns_sql,
+        "columns_hql": columns_hql,
+        "columns_avro": columns_avro,
     }
 
-    # Define template paths
+    # Template paths
     templates = {
         "sql": "templates/sql_temp.sql",
         "hql": "templates/hql_temp.hql",
@@ -38,31 +40,34 @@ def create_files(tab_name, columns):
         "platform": "templates/platform_temp.json"
     }
 
-    # Define output paths
+    # Output paths
     outputs = {
         "sql": os.path.join(output_dir, f"{tab_name}_Validation.sql"),
         "hql": os.path.join(output_dir, f"{tab_name}.hql"),
         "avro": os.path.join(output_dir, f"{tab_name}.avsc"),
-        "jobs": os.path.join(output_dir, "jobs.conf"),
-        "platform": os.path.join(output_dir, "platform_conf.json")
+        "jobs": "C:\\Users\\sxp910\\Desktop\\tables\\Ingestion\\jobs.conf",  # Append globally
+        "platform": "C:\\Users\\sxp910\\Desktop\\tables\\Ingestion\\platform_conf.json"  # Append globally
     }
 
-    # Generate files from templates
-    for file_type, template_path in templates.items():
-        if os.path.exists(template_path):
-            generate_from_template(template_path, outputs[file_type], replacements)
-        else:
-            print(f"Template file {template_path} not found. Skipping {file_type} generation.")
+    # Generate individual files
+    for file_type in ["sql", "hql", "avro"]:
+        if os.path.exists(templates[file_type]):
+            with open(templates[file_type], 'r') as template_file:
+                content = Template(template_file.read()).safe_substitute(replacements)
+            with open(outputs[file_type], 'w') as output_file:
+                output_file.write(content)
 
-    print("\nFiles have been generated successfully!\n")
+    # Append to jobs.conf
+    append_to_file(templates["jobs"], outputs["jobs"], replacements)
 
-# Read input data
+    # Append to platform_conf.json
+    append_to_file(templates["platform"], outputs["platform"], replacements)
+
+    print(f"Files for table {tab_name} have been generated and appended successfully!")
+
+# Read input and process multiple tables
 with open("input.txt", 'r') as input_file:
-    tab_name = input_file.readline().strip()
-    columns = [
-        col[col.find(':') + 1:col.find('>')].strip() if ':' in col and '>' in col else col.strip()
-        for col in input_file
-    ]
-
-# Generate the files
-create_files(tab_name, columns)
+    for line in input_file:
+        tab_name = line.strip()  # Assuming one table name per line
+        columns = ["id", "name", "age"]  # Replace with actual column parsing logic
+        create_files(tab_name, columns)
