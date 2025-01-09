@@ -1,13 +1,21 @@
 import csv
 import os
 
-# Read input.csv
+# Read input.csv, handle missing columns
 def parse_input_csv(file_path):
     with open(file_path, "r") as csv_file:
         reader = csv.reader(csv_file)
         headers = next(reader)  # First row contains table names
         columns = list(reader)  # Remaining rows contain columns
-    table_data = {table: [row[i] for row in columns if row[i]] for i, table in enumerate(headers)}
+
+    # Initialize a dictionary to hold table names and corresponding columns
+    table_data = {}
+    for i, table in enumerate(headers):
+        # Filter out empty values from the column data
+        valid_columns = [row[i] for row in columns if row[i]]
+        if valid_columns:  # Only add if the table has valid columns
+            table_data[table] = valid_columns
+
     return table_data
 
 # Replace placeholders in templates
