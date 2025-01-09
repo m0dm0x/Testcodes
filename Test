@@ -76,4 +76,12 @@ def generate_files(input_csv, output_dir, templates_dir):
     print("Files generated successfully!")
 
 # Main execution
-input_csv_path = "
+input_csv_path = "input.csv"  # Path to your input.csv
+output_dir = "output"  # Output directory for generated files
+templates_dir = "templates"  # Directory where your template files are stored
+
+# Ensure output directory exists
+os.makedirs(output_dir, exist_ok=True)
+
+# Generate files
+generate_files(input_csv_path, output_dir, templates_dir)
