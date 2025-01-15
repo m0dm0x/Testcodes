@@ -1,111 +1,23 @@
-import csv
-import os
+import pandas as pd
 
-# Read input.csv, handle missing columns
-def parse_input_csv(file_path):
-    with open(file_path, "r") as csv_file:
-        reader = csv.reader(csv_file)
-        headers = next(reader)  # First row contains table names
-        columns = list(reader)  # Remaining rows contain columns
+# Read the CSV file
+file_path = "your_file.csv"  # Replace with your file path
+df = pd.read_csv(file_path)
 
-    # Initialize a dictionary to hold table names and corresponding columns
-    table_data = {}
-    for i, table in enumerate(headers):
-        # Filter out empty values from the column data
-        valid_columns = [row[i] for row in columns if row[i]]
-        if valid_columns:  # Only add if the table has valid columns
-            table_data[table] = valid_columns
+# Add a helper column to create row numbers
+df["RowIndex"] = df.groupby("ColA").cumcount()
 
-    return table_data
+# Pivot the DataFrame
+pivot_df = df.pivot(index="RowIndex", columns="ColA", values="ColB")
 
-# Replace placeholders in templates
-def replace_placeholders(template_content, replacements):
-    for placeholder, value in replacements.items():
-        template_content = template_content.replace(placeholder, value)
-    return template_content
+# Fill missing values with empty strings
+pivot_df = pivot_df.fillna("")
 
-# Write generated content to a file
-def write_to_file(output_path, content, append=False):
-    mode = "a" if append else "w"
-    with open(output_path, mode) as file:
-        file.write(content + "\n")
+# Remove the index name
+pivot_df.reset_index(drop=True, inplace=True)
 
-# Check if the table already exists in the job.conf and platform_conf.json
-def table_exists_in_file(file_path, table_name):
-    if os.path.exists(file_path):
-        with open(file_path, "r") as file:
-            content = file.read()
-            return f'"{table_name}"' in content  # Check for table name in the file
-    return False
+# Save the result to a new CSV file
+output_file = "pivoted_output.csv"
+pivot_df.to_csv(output_file, index=False)
 
-# Generate files for each table
-def generate_files(input_csv, output_dir, templates_dir):
-    table_data = parse_input_csv(input_csv)
-    
-    for table_name, columns in table_data.items():
-        # Create a separate folder for each table
-        table_dir = os.path.join(output_dir, table_name)
-        os.makedirs(table_dir, exist_ok=True)
-        
-        column_list = ",".join(columns)
-        column_list_avro = ",\n".join(
-            [
-                f'{{"name": "{col}", "type": ["null", "string"], "default": null, "columnName": "{col}", "sqlType": "12"}}'
-                for col in columns
-            ]
-        )
-
-        # Generate SQL File
-        sql_template_path = os.path.join(templates_dir, "sql_temp.sql")
-        with open(sql_template_path, "r") as file:
-            sql_template = file.read()
-        sql_content = replace_placeholders(sql_template, {"$columns": column_list})
-        write_to_file(os.path.join(table_dir, f"{table_name}_Validation.sql"), sql_content)
-
-        # Generate HQL File
-        hql_template_path = os.path.join(templates_dir, "hql_temp.hql")
-        with open(hql_template_path, "r") as file:
-            hql_template = file.read()
-        hql_content = replace_placeholders(hql_template, {"$columns": column_list})
-        write_to_file(os.path.join(table_dir, f"{table_name}.hql"), hql_content)
-
-        # Generate AVRO File
-        avro_template_path = os.path.join(templates_dir, "avro_temp.avsc")
-        with open(avro_template_path, "r") as file:
-            avro_template = file.read()
-        avro_content = replace_placeholders(avro_template, {"$columns_avro": column_list_avro})
-        write_to_file(os.path.join(table_dir, f"{table_name}.avsc"), avro_content)
-
-        # Append to Job.conf (if not already added)
-        job_file_path = os.path.join(output_dir, "job.conf")
-        if not table_exists_in_file(job_file_path, table_name):
-            job_template_path = os.path.join(templates_dir, "job_temp.conf")
-            with open(job_template_path, "r") as file:
-                job_template = file.read()
-            job_content = replace_placeholders(
-                job_template,
-                {"$table_name": table_name, "$columns": column_list},
-            )
-            write_to_file(job_file_path, job_content, append=True)
-
-        # Append to Platform_conf.json (if not already added)
-        platform_file_path = os.path.join(output_dir, "platform_conf.json")
-        if not table_exists_in_file(platform_file_path, table_name):
-            platform_template_path = os.path.join(templates_dir, "platform_temp.json")
-            with open(platform_template_path, "r") as file:
-                platform_template = file.read()
-            platform_content = replace_placeholders(platform_template, {"$table_name": table_name})
-            write_to_file(platform_file_path, platform_content, append=True)
-
-    print("Files generated successfully!")
-
-# Main execution
-input_csv_path = "input.csv"  # Path to your input.csv
-output_dir = "output"  # Output directory for generated files
-templates_dir = "templates"  # Directory where your template files are stored
-
-# Ensure output directory exists
-os.makedirs(output_dir, exist_ok=True)
-
-# Generate files
-generate_files(input_csv_path, output_dir, templates_dir)
+print(f"Pivoted data saved to {output_file}")
