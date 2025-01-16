@@ -5,19 +5,23 @@ file_path = "your_file.csv"  # Replace with your file path
 df = pd.read_csv(file_path)
 
 # Add a helper column to track row numbers for grouping
-df["RowIndex"] = df.groupby(["ColA", "cola1", "cola2"]).cumcount()
+df["RowIndex"] = df.groupby(["ColA"]).cumcount()
 
 # Pivot the DataFrame
-pivot_df = df.pivot(index="RowIndex", columns=["ColA", "cola1", "cola2"], values="ColB")
+pivot_df = df.pivot(index="RowIndex", columns=["ColA"], values="ColB")
 
-# Fill missing values with empty strings
-pivot_df = pivot_df.fillna("")
+# Rearrange columns to get cola1 and cola2 as additional header rows
+header_1 = df.groupby("ColA").first().loc[pivot_df.columns, "cola1"].values
+header_2 = df.groupby("ColA").first().loc[pivot_df.columns, "cola2"].values
 
-# Adjust the column headers for proper formatting
-pivot_df.columns = pd.MultiIndex.from_tuples(pivot_df.columns, names=["ColA", "cola1", "cola2"])
+# Update column names with multi-level headers
+pivot_df.columns = pd.MultiIndex.from_arrays([pivot_df.columns, header_1, header_2])
 
-# Write to a CSV file with multi-level headers
+# Reset the index for a clean output
+pivot_df.reset_index(drop=True, inplace=True)
+
+# Save the result to a new CSV file
 output_file = "pivoted_output.csv"
-pivot_df.to_csv(output_file, index=False)
+pivot_df.to_csv(output_file, index=False, header=True)
 
 print(f"Pivoted data saved to {output_file}")
