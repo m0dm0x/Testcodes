@@ -1,95 +1,128 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.utils import AnalysisException
-import logging
-import time
 import json
 import yaml
-import gcsfs  # GCS connector for Python
+import gcsfs
+import time
+import logging
+from pyspark.sql import SparkSession
+from pyspark.sql.utils import AnalysisException
 
-# Initialize Spark Session
-spark = SparkSession.builder \
-    .appName("Dynamic SQL Transformation Pipeline with GCS") \
-    .getOrCreate()
 
-# Set logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+class GCSClientSingleton:
+    """
+    Singleton class to manage GCS client connection.
+    Ensures a single instance of the GCSFileSystem is created.
+    """
+    _instance = None
 
-# Load configuration
-def load_sql_config(config_gcs_path):
-    """
-    Loads the SQL transformation rules from a JSON or YAML configuration file in GCS.
-    Uses gcsfs for secure access to GCS.
-    """
-    fs = gcsfs.GCSFileSystem()
-    with fs.open(config_gcs_path, "r") as config_file:
-        content = config_file.read()
-        if config_gcs_path.endswith(".json"):
-            return json.loads(content)
-        elif config_gcs_path.endswith(".yaml") or config_gcs_path.endswith(".yml"):
-            return yaml.safe_load(content)
-        else:
-            raise ValueError("Unsupported configuration file format. Use JSON or YAML.")
+    @staticmethod
+    def get_instance():
+        if GCSClientSingleton._instance is None:
+            GCSClientSingleton._instance = gcsfs.GCSFileSystem()
+        return GCSClientSingleton._instance
 
-# Read input data
-def read_source_data(input_gcs_path):
-    """
-    Reads the source data from GCS into a DataFrame.
-    """
-    return spark.read.parquet(input_gcs_path)
 
-# Apply SQL Transformation
-def apply_sql_transformation(source_df, sql_query):
-    """
-    Applies the provided SQL transformation to the source DataFrame.
-    """
-    source_df.createOrReplaceTempView("customer_data")
-    return spark.sql(sql_query)
+class PySparkTransformationPipeline:
+    def __init__(self, config_gcs_path, input_gcs_path, output_gcs_path, error_gcs_path):
+        self.spark = SparkSession.builder.appName("Dynamic SQL Transformation Pipeline with GCS").getOrCreate()
+        self.config_gcs_path = config_gcs_path
+        self.input_gcs_path = input_gcs_path
+        self.output_gcs_path = output_gcs_path
+        self.error_gcs_path = error_gcs_path
+        self.logger = logging.getLogger(__name__)
+        logging.basicConfig(level=logging.INFO)
+        self.gcs_client = GCSClientSingleton.get_instance()
 
-# Write output data
-def write_output_data(target_df, output_gcs_path):
-    """
-    Writes the transformed DataFrame to GCS in Parquet format.
-    """
-    target_df.write.mode("overwrite").parquet(output_gcs_path)
+    def load_sql_config(self):
+        """
+        Loads the SQL transformation rules from a JSON or YAML configuration file in GCS.
+        """
+        try:
+            with self.gcs_client.open(self.config_gcs_path, "r") as config_file:
+                content = config_file.read()
+                if self.config_gcs_path.endswith(".json"):
+                    return json.loads(content)
+                elif self.config_gcs_path.endswith(".yaml") or self.config_gcs_path.endswith(".yml"):
+                    return yaml.safe_load(content)
+                else:
+                    raise ValueError("Unsupported configuration file format. Use JSON or YAML.")
+        except Exception as e:
+            self.log_error(f"Error loading configuration: {str(e)}")
+            raise
 
-# Log errors
-def log_error(error_gcs_path, error_description):
-    """
-    Logs errors to a specified GCS path.
-    """
-    error_timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    error_message = f"Error at {error_timestamp}: {error_description}\n"
-    spark.createDataFrame([(error_message,)], ["error"]).write.mode("append").text(error_gcs_path)
+    def read_source_data(self):
+        """
+        Reads the source data from GCS into a DataFrame.
+        """
+        try:
+            df = self.spark.read.parquet(self.input_gcs_path)
+            self.logger.info("Source data loaded successfully.")
+            return df
+        except Exception as e:
+            self.log_error(f"Error reading source data: {str(e)}")
+            raise
 
-# Main pipeline
-def transformation_pipeline(config_gcs_path, input_gcs_path, output_gcs_path, error_gcs_path):
-    """
-    Main transformation pipeline function.
-    """
-    try:
-        # Load SQL transformation rules
-        config = load_sql_config(config_gcs_path)
-        sql_query = config.get("sql_query")
-        if not sql_query:
-            raise ValueError("SQL query not found in the configuration file.")
+    def apply_sql_transformation(self, source_df, sql_query):
+        """
+        Applies the provided SQL transformation to the source DataFrame.
+        """
+        try:
+            source_df.createOrReplaceTempView("customer_data")
+            target_df = self.spark.sql(sql_query)
+            self.logger.info("SQL transformation applied successfully.")
+            return target_df
+        except AnalysisException as e:
+            self.log_error(f"SQL AnalysisException: {str(e)}")
+            raise
+        except Exception as e:
+            self.log_error(f"Unexpected error during SQL transformation: {str(e)}")
+            raise
 
-        # Read source data
-        source_df = read_source_data(input_gcs_path)
-        logger.info("Source data loaded successfully.")
+    def write_output_data(self, target_df):
+        """
+        Writes the transformed DataFrame to GCS in Parquet format.
+        """
+        try:
+            target_df.write.mode("overwrite").parquet(self.output_gcs_path)
+            self.logger.info(f"Transformed data written to {self.output_gcs_path} successfully.")
+        except Exception as e:
+            self.log_error(f"Error writing output data: {str(e)}")
+            raise
 
-        # Apply SQL Transformation
-        target_df = apply_sql_transformation(source_df, sql_query)
-        logger.info("SQL transformation applied successfully.")
+    def log_error(self, error_description):
+        """
+        Logs errors to a specified GCS path.
+        """
+        try:
+            error_timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            error_message = f"Error at {error_timestamp}: {error_description}\n"
+            self.spark.createDataFrame([(error_message,)], ["error"]).write.mode("append").text(self.error_gcs_path)
+        except Exception as e:
+            self.logger.error(f"Error logging the error: {str(e)}")
 
-        # Write output data
-        write_output_data(target_df, output_gcs_path)
-        logger.info(f"Transformed data written to {output_gcs_path} successfully.")
+    def run_pipeline(self):
+        """
+        Executes the full transformation pipeline.
+        """
+        try:
+            # Load SQL transformation rules
+            config = self.load_sql_config()
+            sql_query = config.get("sql_query")
+            if not sql_query:
+                raise ValueError("SQL query not found in the configuration file.")
 
-    except AnalysisException as e:
-        log_error(error_gcs_path, f"SQL AnalysisException: {str(e)}")
-    except Exception as e:
-        log_error(error_gcs_path, f"Unexpected error: {str(e)}")
+            # Read source data
+            source_df = self.read_source_data()
+
+            # Apply SQL Transformation
+            target_df = self.apply_sql_transformation(source_df, sql_query)
+
+            # Write output data
+            self.write_output_data(target_df)
+
+        except Exception as e:
+            self.log_error(f"Pipeline execution failed: {str(e)}")
+            raise
+
 
 # Example Usage
 if __name__ == "__main__":
@@ -98,4 +131,5 @@ if __name__ == "__main__":
     OUTPUT_GCS_PATH = "gs://your-bucket-name/output_data"         # Path to save output Parquet file in GCS
     ERROR_GCS_PATH = "gs://your-bucket-name/error_logs"           # Path to save error logs in GCS
 
-    transformation_pipeline(CONFIG_GCS_PATH, INPUT_GCS_PATH, OUTPUT_GCS_PATH, ERROR_GCS_PATH)
+    pipeline = PySparkTransformationPipeline(CONFIG_GCS_PATH, INPUT_GCS_PATH, OUTPUT_GCS_PATH, ERROR_GCS_PATH)
+    pipeline.run_pipeline()
