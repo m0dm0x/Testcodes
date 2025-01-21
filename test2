@@ -1,0 +1,101 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.utils import AnalysisException
+import logging
+import time
+import json
+import yaml
+import gcsfs  # GCS connector for Python
+
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("Dynamic SQL Transformation Pipeline with GCS") \
+    .getOrCreate()
+
+# Set logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load configuration
+def load_sql_config(config_gcs_path):
+    """
+    Loads the SQL transformation rules from a JSON or YAML configuration file in GCS.
+    Uses gcsfs for secure access to GCS.
+    """
+    fs = gcsfs.GCSFileSystem()
+    with fs.open(config_gcs_path, "r") as config_file:
+        content = config_file.read()
+        if config_gcs_path.endswith(".json"):
+            return json.loads(content)
+        elif config_gcs_path.endswith(".yaml") or config_gcs_path.endswith(".yml"):
+            return yaml.safe_load(content)
+        else:
+            raise ValueError("Unsupported configuration file format. Use JSON or YAML.")
+
+# Read input data
+def read_source_data(input_gcs_path):
+    """
+    Reads the source data from GCS into a DataFrame.
+    """
+    return spark.read.parquet(input_gcs_path)
+
+# Apply SQL Transformation
+def apply_sql_transformation(source_df, sql_query):
+    """
+    Applies the provided SQL transformation to the source DataFrame.
+    """
+    source_df.createOrReplaceTempView("customer_data")
+    return spark.sql(sql_query)
+
+# Write output data
+def write_output_data(target_df, output_gcs_path):
+    """
+    Writes the transformed DataFrame to GCS in Parquet format.
+    """
+    target_df.write.mode("overwrite").parquet(output_gcs_path)
+
+# Log errors
+def log_error(error_gcs_path, error_description):
+    """
+    Logs errors to a specified GCS path.
+    """
+    error_timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    error_message = f"Error at {error_timestamp}: {error_description}\n"
+    spark.createDataFrame([(error_message,)], ["error"]).write.mode("append").text(error_gcs_path)
+
+# Main pipeline
+def transformation_pipeline(config_gcs_path, input_gcs_path, output_gcs_path, error_gcs_path):
+    """
+    Main transformation pipeline function.
+    """
+    try:
+        # Load SQL transformation rules
+        config = load_sql_config(config_gcs_path)
+        sql_query = config.get("sql_query")
+        if not sql_query:
+            raise ValueError("SQL query not found in the configuration file.")
+
+        # Read source data
+        source_df = read_source_data(input_gcs_path)
+        logger.info("Source data loaded successfully.")
+
+        # Apply SQL Transformation
+        target_df = apply_sql_transformation(source_df, sql_query)
+        logger.info("SQL transformation applied successfully.")
+
+        # Write output data
+        write_output_data(target_df, output_gcs_path)
+        logger.info(f"Transformed data written to {output_gcs_path} successfully.")
+
+    except AnalysisException as e:
+        log_error(error_gcs_path, f"SQL AnalysisException: {str(e)}")
+    except Exception as e:
+        log_error(error_gcs_path, f"Unexpected error: {str(e)}")
+
+# Example Usage
+if __name__ == "__main__":
+    CONFIG_GCS_PATH = "gs://your-bucket-name/config/config.json"  # Path to SQL config file in GCS (JSON or YAML)
+    INPUT_GCS_PATH = "gs://your-bucket-name/input_data"           # Path to input Parquet file in GCS
+    OUTPUT_GCS_PATH = "gs://your-bucket-name/output_data"         # Path to save output Parquet file in GCS
+    ERROR_GCS_PATH = "gs://your-bucket-name/error_logs"           # Path to save error logs in GCS
+
+    transformation_pipeline(CONFIG_GCS_PATH, INPUT_GCS_PATH, OUTPUT_GCS_PATH, ERROR_GCS_PATH)
