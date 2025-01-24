@@ -1,116 +1,83 @@
-from pyspark.errors import PySparkRuntimeError
+from pyspark.sql import SparkSession
 from edh_ingestion_modules.models.task import Task
 from edh_ingestion_modules.models.task_status import TaskStatus
-from edh_ingestion_modules.utilities.service_factory import ServiceFactory
 from edh_ingestion_modules.utilities.exceptions import TransformationFailedError
-
 
 class TransformationTask(Task):
     """
-    TransformationTask performs SQL-based transformations on input DataFrames and 
-    outputs the transformed DataFrame to a snapshot.
-
-    **Required Configuration Keys:**
-    - `inputDataFrame`: Comma-separated string of input DataFrame IDs.
-    - `sqlFile`: Path to the SQL file containing the transformation query.
-    - `outputDataFrame`: The ID for the output DataFrame (to be stored in snapshots).
-    - `delimiter` (Optional): Delimiter used to separate input DataFrame IDs. Default is ','.
-    - `continueOnMissing` (Optional): Boolean to indicate if the task should continue if any input DataFrame is missing. Default is `False`.
+    TransformationTask applies SQL transformations to a given input DataFrame
+    and stores the result as an output DataFrame in the TaskSnapshot.
     """
 
     def __init__(self, config: dict):
         """
-        Initializes the TransformationTask with the given configuration.
+        Initialize the task with the provided configuration.
 
-        Args:
-            config (dict): Configuration dictionary containing the keys described above.
+        :param config: A dictionary containing task-specific configuration.
         """
         self.config = config
 
     def execute(self):
         """
-        Executes the transformation task:
-        - Validates input DataFrames.
-        - Reads and executes the SQL query from the specified file.
-        - Stores the transformed DataFrame in the task snapshot.
+        Execute the transformation task.
 
-        Returns:
-            Tuple[TaskStatus, Optional[Exception]]:
-                - TaskStatus.SUCCESS if execution is successful.
-                - TaskStatus.FAILED with the corresponding exception if execution fails.
+        - Reads the input DataFrame from the TaskSnapshot.
+        - Loads SQL transformation logic from a YAML configuration.
+        - Applies the SQL query to the input DataFrame.
+        - Stores the transformed DataFrame in the TaskSnapshot.
+
+        :return: Tuple of TaskStatus and optional Exception.
         """
-        # Initialize status as SUCCESS
         status = TaskStatus.SUCCESS, None
-
-        # Access required instances from the Task superclass
         spark = self.spark_instance
         logger = self.logger_instance
         snapshots = self.snapshot_instance
         config = self.config
 
-        logger.info("Starting TransformationTask execution...")
-
         try:
-            # Fetching required configuration values
-            input_dataframes = config.get("inputDataFrame", "").split(",")
-            sql_file_path = config.get("sqlFile")
-            output_df_id = config.get("outputDataFrame")
-            delimiter = config.get("delimiter", ",")
-            continue_on_missing = config.get("continueOnMissing", False)
+            logger.info("Starting Transformation Task...")
 
-            logger.info(f"Input DataFrames: {input_dataframes}")
-            logger.info(f"SQL File Path: {sql_file_path}")
-            logger.info(f"Output DataFrame ID: {output_df_id}")
+            # Get input and output DataFrame IDs from the config
+            input_df_id = config.get("input_df_id")
+            output_df_id = config.get("output_df_id")
+            sql_file_path = config.get("sql_file")
 
-            # Validate the presence of all input DataFrames in snapshots
-            logger.info("Validating input DataFrames...")
-            all_exist = all(snapshots.get_snapshot(df) is not None for df in input_dataframes)
+            # Validate presence of input DataFrame in snapshot
+            input_df = snapshots.get_snapshot(input_df_id)
+            if input_df is None:
+                raise TransformationFailedError(f"Input DataFrame '{input_df_id}' not found in TaskSnapshot.")
 
-            if not all_exist and not continue_on_missing:
-                raise TransformationFailedError("One or more input DataFrames are missing.")
+            logger.info(f"Input DataFrame '{input_df_id}' found. Proceeding with transformation.")
 
-            # Register all available input DataFrames as temporary views in Spark
-            for df_id in input_dataframes:
-                df = snapshots.get_snapshot(df_id)
-                if df is not None:
-                    df.createOrReplaceTempView(df_id)
-                    logger.info(f"Registered DataFrame {df_id} as a temporary view.")
-                elif continue_on_missing:
-                    logger.warning(f"Input DataFrame {df_id} is missing, but `continueOnMissing` is True.")
-
-            # Read the SQL query from the file
-            logger.info(f"Reading SQL query from file: {sql_file_path}")
-            with open(sql_file_path, "r") as sql_file:
+            # Load SQL query from file
+            with open(sql_file_path, 'r') as sql_file:
                 sql_query = sql_file.read()
+            logger.info("SQL query loaded successfully.")
 
-            # Execute the SQL query using Spark
-            logger.info("Executing SQL transformation...")
+            # Register input DataFrame as a temporary view for SQL execution
+            input_df.createOrReplaceTempView(input_df_id)
+
+            # Execute the SQL query
+            logger.info(f"Executing SQL query on input DataFrame '{input_df_id}'.")
             transformed_df = spark.sql(sql_query)
-            logger.info("SQL transformation executed successfully.")
+            logger.info("SQL query executed successfully.")
 
-            # Add the transformed DataFrame to the snapshots
-            logger.info(f"Storing transformed DataFrame with ID: {output_df_id}")
+            # Add the transformed DataFrame to the snapshot with the output ID
             snapshots.add_snapshot(output_df_id, transformed_df)
-
-        except TransformationFailedError as e:
-            # Handling custom transformation failure
-            logger.error(f"Transformation failed: {e}")
-            status = TaskStatus.FAILED, e
-
-        except PySparkRuntimeError as e:
-            # Handling PySpark-specific runtime errors
-            logger.error(f"PySpark runtime error during transformation: {e}")
-            status = TaskStatus.FAILED, e
-
-        except FileNotFoundError as e:
-            # Handling SQL file not found
-            logger.error(f"SQL file not found: {e}")
-            status = TaskStatus.FAILED, e
+            logger.info(f"Transformed DataFrame added to TaskSnapshot with ID '{output_df_id}'.")
 
         except Exception as e:
-            # Catching any unexpected errors
-            logger.error(f"Unexpected error during transformation: {e}")
+            # Catch any transformation errors and update the status
+            logger.error(f"Transformation task failed: {str(e)}")
             status = TaskStatus.FAILED, e
 
-        # Returning the task execution status
         return status
+
+    def is_executable(self) -> bool:
+        """
+        Determine if the task is executable based on the current status.
+        The task will execute if the pipeline has not failed.
+
+        :return: Boolean indicating executability of the task.
+        """
+        return self.snapshot_instance.status != TaskStatus.FAILED
