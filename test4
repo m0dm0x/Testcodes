@@ -1,14 +1,13 @@
 from pyspark.sql import SparkSession
 from edh_ingestion_modules.models.task import Task
 from edh_ingestion_modules.models.task_status import TaskStatus
-from edh_ingestion_modules.utilities.exceptions import TransformationFailedError, ServiceNotFoundException
-from edh_ingestion_modules.utilities.service_factory import ServiceFactory
+from edh_ingestion_modules.utilities.exceptions import TransformationFailedError
 
 
 class TransformationTask(Task):
     """
-    TransformationTask applies SQL transformations to a given input DataFrame
-    and stores the result as an output DataFrame in the TaskSnapshot.
+    TransformationTask applies SQL transformations to a DataFrame saved in the TaskSnapshot
+    by a preceding task and saves the transformed DataFrame back to the TaskSnapshot.
     """
 
     def __init__(self, config: dict):
@@ -23,11 +22,10 @@ class TransformationTask(Task):
         """
         Execute the transformation task.
 
-        - Dynamically resolves a service using ServiceFactory if required.
         - Reads the input DataFrame from the TaskSnapshot.
-        - Loads SQL transformation logic (from file or service).
+        - Loads SQL transformation logic (from a file or dynamically).
         - Applies the SQL query to the input DataFrame.
-        - Stores the transformed DataFrame in the TaskSnapshot.
+        - Stores the transformed DataFrame back into the TaskSnapshot.
 
         :return: Tuple of TaskStatus and optional Exception.
         """
@@ -40,33 +38,25 @@ class TransformationTask(Task):
         try:
             logger.info("Starting Transformation Task...")
 
-            # Get input and output DataFrame IDs from the config
-            input_df_id = config.get("input_df_id")
-            output_df_id = config.get("output_df_id")
-            sql_file_path = config.get("sql_file")
+            # Get input and output DataFrame IDs and delimiter from the config
+            input_df_id = config.get("input_df_id")  # ID of the DataFrame saved in TaskSnapshot by DataLoaderTask
+            output_df_id = config.get("output_df_id")  # ID to save the transformed DataFrame
+            sql_file_path = config.get("sql_file")  # Path to the SQL file containing transformation logic
+            delimiter = config.get("delimiter", ",")  # Delimiter (default is ',')
 
-            # Validate presence of input DataFrame in snapshot
+            logger.info(f"Delimiter provided: '{delimiter}'.")
+
+            # Validate that the input DataFrame exists in the TaskSnapshot
             input_df = snapshots.get_snapshot(input_df_id)
             if input_df is None:
                 raise TransformationFailedError(f"Input DataFrame '{input_df_id}' not found in TaskSnapshot.")
 
             logger.info(f"Input DataFrame '{input_df_id}' found. Proceeding with transformation.")
 
-            # Dynamically resolve a service if specified in the configuration
-            service = None
-            if "service_type" in config:
-                logger.info("Resolving transformation service using ServiceFactory...")
-                service = ServiceFactory.resolve_service(config)
-                logger.info(f"Service resolved successfully: {service.__class__.__name__}")
-
-            # Load SQL query (from file or via the resolved service)
-            if service:
-                logger.info("Loading SQL query using resolved service...")
-                sql_query = service.read()  # Assuming service.read() returns a query string
-            else:
-                logger.info("Loading SQL query from file...")
-                with open(sql_file_path, 'r') as sql_file:
-                    sql_query = sql_file.read()
+            # Load SQL query from file
+            logger.info("Loading SQL query from file...")
+            with open(sql_file_path, 'r') as sql_file:
+                sql_query = sql_file.read()
 
             logger.info("SQL query loaded successfully.")
 
@@ -82,12 +72,8 @@ class TransformationTask(Task):
             snapshots.add_snapshot(output_df_id, transformed_df)
             logger.info(f"Transformed DataFrame added to TaskSnapshot with ID '{output_df_id}'.")
 
-        except ServiceNotFoundException as e:
-            logger.error(f"Service resolution failed: {str(e)}")
-            status = TaskStatus.FAILED, e
-
         except Exception as e:
-            # Catch any transformation errors and update the status
+            # Catch any errors during execution and update the status
             logger.error(f"Transformation task failed: {str(e)}")
             status = TaskStatus.FAILED, e
 
