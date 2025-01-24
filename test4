@@ -8,6 +8,7 @@ class TransformationTask(Task):
     """
     TransformationTask applies SQL transformations to a DataFrame saved in the TaskSnapshot
     by a preceding task and saves the transformed DataFrame back to the TaskSnapshot.
+    Includes query optimization for performance.
     """
 
     def __init__(self, config: dict):
@@ -24,7 +25,7 @@ class TransformationTask(Task):
 
         - Reads the input DataFrame from the TaskSnapshot.
         - Loads SQL transformation logic (from a file or dynamically).
-        - Applies the SQL query to the input DataFrame.
+        - Applies optimizations and executes the SQL query.
         - Stores the transformed DataFrame back into the TaskSnapshot.
 
         :return: Tuple of TaskStatus and optional Exception.
@@ -36,13 +37,13 @@ class TransformationTask(Task):
         config = self.config
 
         try:
-            logger.info("Starting Transformation Task...")
+            logger.info("Starting Transformation Task with Optimizations...")
 
             # Get input and output DataFrame IDs and delimiter from the config
-            input_df_id = config.get("input_df_id")  # ID of the DataFrame saved in TaskSnapshot by DataLoaderTask
-            output_df_id = config.get("output_df_id")  # ID to save the transformed DataFrame
-            sql_file_path = config.get("sql_file")  # Path to the SQL file containing transformation logic
-            delimiter = config.get("delimiter", ",")  # Delimiter (default is ',')
+            input_df_id = config.get("input_df_id")
+            output_df_id = config.get("output_df_id")
+            sql_file_path = config.get("sql_file")
+            delimiter = config.get("delimiter", ",")
 
             logger.info(f"Delimiter provided: '{delimiter}'.")
 
@@ -53,6 +54,11 @@ class TransformationTask(Task):
 
             logger.info(f"Input DataFrame '{input_df_id}' found. Proceeding with transformation.")
 
+            # Analyze the input DataFrame for optimizations
+            logger.info("Analyzing DataFrame partitions and size...")
+            input_df_size = input_df.count()
+            logger.info(f"Input DataFrame size: {input_df_size} rows.")
+
             # Load SQL query from file
             logger.info("Loading SQL query from file...")
             with open(sql_file_path, 'r') as sql_file:
@@ -60,8 +66,20 @@ class TransformationTask(Task):
 
             logger.info("SQL query loaded successfully.")
 
+            # Optimize: Apply broadcast join hint if needed
+            if input_df_size < 1000000:  # Example threshold for a small DataFrame
+                logger.info("Applying broadcast join hint for optimization...")
+                input_df = input_df.hint("broadcast")
+
             # Register input DataFrame as a temporary view for SQL execution
             input_df.createOrReplaceTempView(input_df_id)
+
+            # Analyze the logical and physical plans for debugging and optimization
+            logger.info("Analyzing logical and physical plans...")
+            logical_plan = spark.sql(sql_query).queryExecution.logical
+            physical_plan = spark.sql(sql_query).queryExecution.executedPlan
+            logger.info(f"Logical Plan:\n{logical_plan}")
+            logger.info(f"Physical Plan:\n{physical_plan}")
 
             # Execute the SQL query
             logger.info(f"Executing SQL query on input DataFrame '{input_df_id}'.")
