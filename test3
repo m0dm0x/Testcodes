@@ -1,155 +1,86 @@
-import json
-import logging
-from pyspark.sql import SparkSession
-from pathlib import Path
-from typing import List
+from typing import Tuple, Optional, Union
+from pyspark.sql import SparkSession, DataFrame
+from edh_logger import EdhPysparkLogger  # Assuming EdhPysparkLogger is part of your project
+from task_snapshot import TaskSnapshot  # Assuming TaskSnapshot is part of your project
+from task_status import TaskStatus  # Enum for task execution status
+from task import Task  # Abstract base class for all tasks
 
-# Assuming you have equivalent utility classes and methods like `ExecutionContext` and `Configuration`.
-class TransformWithSQLTask:
+
+class TransformationTask(Task):
     """
-    A Python implementation of the TransformWithSQL task using PySpark,
-    based on inputs provided dynamically through a JSON configuration.
+    Task for applying SQL transformations on input DataFrames.
+    Inherits from the abstract Task class.
     """
 
-    def __init__(self, task_id: str, config_path: str, context):
+    def __init__(self, config: dict):
         """
-        Initialize the TransformWithSQLTask.
+        Initialize the TransformationTask with the given configuration.
 
-        :param task_id: Unique identifier for the task.
-        :param config_path: Path to the JSON configuration file.
-        :param context: ExecutionContext object to manage execution state and data.
+        Args:
+            config (dict): Configuration for the task, including paths, SQL files, etc.
         """
-        self.task_id = task_id
-        self.config_path = config_path
-        self.context = context
-        self.spark = context.spark_session
-        self.logger = logging.getLogger(__name__)
-        logging.basicConfig(level=logging.INFO)
+        super().__init__(config)
+        self.sql_file_path = self.config.get("sqlFile")
+        self.delimiter = self.config.get("delimiter", ",")
+        self.continue_on_missing = self.config.get("continueOnMissing", False)
 
-    def load_config(self):
+    def execute(self) -> Tuple[TaskStatus, Optional[Union[Exception, str]]]:
         """
-        Load configuration from the JSON file.
+        Execute the transformation task.
 
-        :return: Configuration dictionary.
+        Returns:
+            Tuple[TaskStatus, Optional[Union[Exception, str]]]: Execution status and any error description.
         """
         try:
-            with open(self.config_path, "r") as file:
-                config = json.load(file)
-            self.logger.info(f"Configuration loaded successfully for Task ID: {self.task_id}")
-            return config
-        except Exception as e:
-            self.logger.error(f"Failed to load configuration: {str(e)}")
-            raise
-
-    def process_data_frames(
-        self,
-        input_data_frames: str,
-        output_data_frame: str,
-        sql_file_path: str,
-        delimiter: str = ",",
-        continue_on_missing: bool = True,
-    ):
-        """
-        Process input DataFrames and apply SQL transformations.
-
-        :param input_data_frames: Comma-separated names of input DataFrames.
-        :param output_data_frame: Name of the output DataFrame.
-        :param sql_file_path: Path to the SQL file containing transformation logic.
-        :param delimiter: Delimiter for splitting input DataFrame names.
-        :param continue_on_missing: Whether to continue if some input DataFrames are missing.
-        """
-        try:
-            input_data_frames_list = input_data_frames.split(delimiter)
+            # Validate input DataFrames
+            input_dataframes = self.config["inputDataFrame"].split(self.delimiter)
+            output_dataframe = self.config["outputDataFrame"]
             all_exist = all(
-                [self.context.get_data_snapshot(df.strip()) is not None for df in input_data_frames_list]
+                self.snapshot_instance.get_snapshot(df) is not None for df in input_dataframes
             )
 
-            if all_exist:
-                # Register all input DataFrames as temporary views
-                for df_name in input_data_frames_list:
-                    df = self.context.require_data_snapshot(df_name.strip())
-                    df.createOrReplaceTempView(df_name.strip())
+            if not all_exist and not self.continue_on_missing:
+                raise ValueError("Some input DataFrames are missing and continueOnMissing is False.")
 
-                # Read and apply the SQL file
-                sql_query = Path(sql_file_path).read_text()
-                result_df = self.spark.sql(sql_query)
+            # Register input DataFrames as temporary views
+            for df_id in input_dataframes:
+                df = self.snapshot_instance.require_snapshot(df_id)
+                df.createOrReplaceTempView(df_id)
 
-                # Save the output DataFrame
-                self.context.add_data_snapshot(output_data_frame, result_df)
-                self.logger.info(f"Output DataFrame '{output_data_frame}' processed successfully.")
+            # Read and execute the SQL transformation
+            sql_query = self._read_sql_file(self.sql_file_path)
+            transformed_df = self.spark_instance.sql(sql_query)
 
-            elif continue_on_missing:
-                self.logger.warning(
-                    "Some input DataFrames are missing, but proceeding as 'continueOnMissing' is True."
-                )
-                for df_name in input_data_frames_list:
-                    if self.context.get_data_snapshot(df_name.strip()):
-                        df = self.context.require_data_snapshot(df_name.strip())
-                        df.createOrReplaceTempView(df_name.strip())
+            # Add transformed DataFrame to the snapshot
+            self.snapshot_instance.add_snapshot(output_dataframe, transformed_df)
 
-                # Apply a default transformation using the first available DataFrame
-                sql_query = f"SELECT * FROM {input_data_frames_list[0].strip()}"
-                result_df = self.spark.sql(sql_query)
-                self.context.add_data_snapshot(output_data_frame, result_df)
-                self.logger.info(f"Output DataFrame '{output_data_frame}' processed with partial inputs.")
-
-            else:
-                self.logger.error("Missing input DataFrames and 'continueOnMissing' is False. Task aborted.")
-                raise ValueError("Input DataFrames are missing and cannot proceed.")
+            self.logger_instance.info(f"TransformationTask completed successfully for {output_dataframe}.")
+            return TaskStatus.SUCCESS, None
 
         except Exception as e:
-            self.logger.error(f"Error processing DataFrames: {str(e)}")
-            raise
+            error_message = f"Error in TransformationTask: {str(e)}"
+            self.logger_instance.error(error_message)
+            return TaskStatus.FAILED, error_message
 
-    def execute(self):
+    def is_executable(self) -> bool:
         """
-        Execute the task.
+        Determine if the task is executable based on the current context.
+        
+        Returns:
+            bool: True if the task can be executed, False otherwise.
         """
-        try:
-            # Load configuration
-            config = self.load_config()
+        return self.snapshot_instance.status != TaskStatus.FAILED
 
-            # Extract parameters from configuration
-            input_data_frames = config["inputDataFrame"]
-            output_data_frame = config["outputDataFrame"]
-            sql_file_path = config["sqlFile"]
-            delimiter = config.get("delimiter", ",")
-            continue_on_missing = config.get("continueOnMissing", True)
+    @staticmethod
+    def _read_sql_file(file_path: str) -> str:
+        """
+        Read the SQL query from the specified file.
 
-            # Process the DataFrames
-            self.process_data_frames(
-                input_data_frames, output_data_frame, sql_file_path, delimiter, continue_on_missing
-            )
-        except Exception as e:
-            self.logger.error(f"Task execution failed for Task ID '{self.task_id}': {str(e)}")
-            raise
+        Args:
+            file_path (str): Path to the SQL file.
 
-
-# Example usage
-if __name__ == "__main__":
-    # Example ExecutionContext (assuming you have a compatible implementation)
-    class ExecutionContext:
-        def __init__(self):
-            self.spark_session = SparkSession.builder.appName("TransformWithSQLTask").getOrCreate()
-            self.data_snapshots = {}
-
-        def get_data_snapshot(self, name: str):
-            return self.data_snapshots.get(name)
-
-        def require_data_snapshot(self, name: str):
-            if name not in self.data_snapshots:
-                raise ValueError(f"Data snapshot '{name}' is required but not found.")
-            return self.data_snapshots[name]
-
-        def add_data_snapshot(self, name: str, df):
-            self.data_snapshots[name] = df
-
-    # Simulate a running context and example task
-    context = ExecutionContext()
-
-    # Configuration file path
-    config_path = "path/to/config.json"
-
-    # Initialize and execute the task
-    task = TransformWithSQLTask("TransformWithSql", config_path, context)
-    task.execute()
+        Returns:
+            str: SQL query.
+        """
+        with open(file_path, "r") as file:
+            return file.read()
