@@ -1,7 +1,9 @@
 from pyspark.sql import SparkSession
 from edh_ingestion_modules.models.task import Task
 from edh_ingestion_modules.models.task_status import TaskStatus
-from edh_ingestion_modules.utilities.exceptions import TransformationFailedError
+from edh_ingestion_modules.utilities.exceptions import TransformationFailedError, ServiceNotFoundException
+from edh_ingestion_modules.utilities.service_factory import ServiceFactory
+
 
 class TransformationTask(Task):
     """
@@ -21,8 +23,9 @@ class TransformationTask(Task):
         """
         Execute the transformation task.
 
+        - Dynamically resolves a service using ServiceFactory if required.
         - Reads the input DataFrame from the TaskSnapshot.
-        - Loads SQL transformation logic from a YAML configuration.
+        - Loads SQL transformation logic (from file or service).
         - Applies the SQL query to the input DataFrame.
         - Stores the transformed DataFrame in the TaskSnapshot.
 
@@ -49,9 +52,22 @@ class TransformationTask(Task):
 
             logger.info(f"Input DataFrame '{input_df_id}' found. Proceeding with transformation.")
 
-            # Load SQL query from file
-            with open(sql_file_path, 'r') as sql_file:
-                sql_query = sql_file.read()
+            # Dynamically resolve a service if specified in the configuration
+            service = None
+            if "service_type" in config:
+                logger.info("Resolving transformation service using ServiceFactory...")
+                service = ServiceFactory.resolve_service(config)
+                logger.info(f"Service resolved successfully: {service.__class__.__name__}")
+
+            # Load SQL query (from file or via the resolved service)
+            if service:
+                logger.info("Loading SQL query using resolved service...")
+                sql_query = service.read()  # Assuming service.read() returns a query string
+            else:
+                logger.info("Loading SQL query from file...")
+                with open(sql_file_path, 'r') as sql_file:
+                    sql_query = sql_file.read()
+
             logger.info("SQL query loaded successfully.")
 
             # Register input DataFrame as a temporary view for SQL execution
@@ -65,6 +81,10 @@ class TransformationTask(Task):
             # Add the transformed DataFrame to the snapshot with the output ID
             snapshots.add_snapshot(output_df_id, transformed_df)
             logger.info(f"Transformed DataFrame added to TaskSnapshot with ID '{output_df_id}'.")
+
+        except ServiceNotFoundException as e:
+            logger.error(f"Service resolution failed: {str(e)}")
+            status = TaskStatus.FAILED, e
 
         except Exception as e:
             # Catch any transformation errors and update the status
