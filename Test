@@ -63,12 +63,37 @@ class TransformationTask(Task):
                 elif continue_on_missing:
                     logger.warning(f"Skipping missing DataFrame: {df_id}")
 
+            # Analyze DataFrame size and apply optimizations for each input DataFrame
+            for df_id in input_dataframe_ids:
+                input_df = snapshots.get_snapshot(df_id)
+                if input_df:
+                    input_df_count = input_df.count()
+                    logger.info(f"Input DataFrame '{df_id}' has {input_df_count} records.")
+
+                    if input_df_count < 1_000_000:
+                        logger.info(f"Applying broadcast hint and caching for small DataFrame: {df_id}")
+                        input_df = broadcast(input_df).persist(StorageLevel.MEMORY_AND_DISK)
+                    elif input_df_count > 1_000_000_000:
+                        logger.info(f"Applying coalesce for large DataFrame: {df_id}")
+                        input_df = input_df.coalesce(spark.sparkContext.defaultParallelism * 2)
+                    else:
+                        logger.info(f"Repartitioning for medium-sized DataFrame: {df_id}")
+                        input_df = input_df.repartition(spark.sparkContext.defaultParallelism * 4)
+
+                    # Show the Spark plans for debugging and optimization
+                    logger.info(f"Logical and Physical Plans for the Input DataFrame '{df_id}':")
+                    input_df.explain(extended=True)
+
             # Read the SQL file
             with open(sql_file, "r") as file:
                 sql_query = file.read()
 
             logger.info("Executing SQL Query...")
             transformed_df = spark.sql(sql_query)
+
+            # Show the Spark plans for the transformed DataFrame
+            logger.info("Logical and Physical Plans for the Transformed DataFrame:")
+            transformed_df.explain(extended=True)
 
             # Persist the transformed DataFrame
             transformed_df.persist(StorageLevel.MEMORY_AND_DISK)
