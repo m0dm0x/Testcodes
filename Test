@@ -1,6 +1,7 @@
 from pyspark.sql.utils import AnalysisException
 from edh_ingestion_modules.models.task import Task
 from edh_ingestion_modules.models.task_status import TaskStatus
+from edh_ingestion_modules.utilities.exceptions import TransformationFailedError
 
 
 class TransformationTask(Task):
@@ -16,6 +17,7 @@ class TransformationTask(Task):
         self.output_df_id = task_config.get("output_df_id")
         self.sql_file = task_config.get("sql_file")
         self.delimiter = task_config.get("delimiter", ",")
+        self.continue_on_missing = task_config.get("continueOnMissing", False)
 
     def execute(self):
         """
@@ -41,8 +43,13 @@ class TransformationTask(Task):
             logger.info(f"Fetching input DataFrame '{self.input_df_id}' from snapshot...")
             input_df = snapshots.get_snapshot(self.input_df_id)
 
+            # Handle missing DataFrame based on the `continueOnMissing` flag
             if not input_df:
-                raise ValueError(f"Input DataFrame '{self.input_df_id}' not found in snapshot.")
+                if self.continue_on_missing:
+                    logger.warning(f"Input DataFrame '{self.input_df_id}' is missing. Skipping transformation.")
+                    return TaskStatus.SUCCESS, None
+                else:
+                    raise ValueError(f"Input DataFrame '{self.input_df_id}' not found in snapshot.")
 
             # Load SQL query from the file
             logger.info(f"Loading SQL query from: {self.sql_file}")
@@ -72,7 +79,11 @@ class TransformationTask(Task):
 
         except AnalysisException as exc:
             logger.warning(f"SQL execution failed in task '{self.task_id}': {exc}")
-            return TaskStatus.FAILED, exc
+            raise TransformationFailedError(
+                f"SQL transformation failed in task '{self.task_id}' due to analysis exception: {exc}"
+            ) from exc
         except Exception as exc:
             logger.warning(f"An error occurred in TransformationTask '{self.task_id}': {exc}")
-            return TaskStatus.FAILED, exc
+            raise TransformationFailedError(
+                f"TransformationTask '{self.task_id}' encountered an error: {exc}"
+            ) from exc
