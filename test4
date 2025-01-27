@@ -1,107 +1,78 @@
-from pyspark.sql import SparkSession
-from edh_ingestion_modules.models.task import Task
-from edh_ingestion_modules.models.task_status import TaskStatus
-from edh_ingestion_modules.utilities.exceptions import TransformationFailedError
+Class: TransformationTask
+- Inherits from Task and defines a process to transform data using PySpark and SQL queries.
 
+__init__ (Constructor)
+- Initializes the task with a configuration dictionary (`task_config`).
+- Extracts the `taskId` for logging and debugging purposes.
 
-class TransformationTask(Task):
-    """
-    TransformationTask applies SQL transformations to a DataFrame saved in the TaskSnapshot
-    by a preceding task and saves the transformed DataFrame back to the TaskSnapshot.
-    Includes query optimization for performance.
-    """
-
-    def __init__(self, config: dict):
-        """
-        Initialize the task with the provided configuration.
-
-        :param config: A dictionary containing task-specific configuration.
-        """
-        self.config = config
-
-    def execute(self):
-        """
-        Execute the transformation task.
-
-        - Reads the input DataFrame from the TaskSnapshot.
-        - Loads SQL transformation logic (from a file or dynamically).
-        - Applies optimizations and executes the SQL query.
-        - Stores the transformed DataFrame back into the TaskSnapshot.
-
-        :return: Tuple of TaskStatus and optional Exception.
-        """
-        status = TaskStatus.SUCCESS, None
-        spark = self.spark_instance
-        logger = self.logger_instance
-        snapshots = self.snapshot_instance
-        config = self.config
-
-        try:
-            logger.info("Starting Transformation Task with Optimizations...")
-
-            # Get input and output DataFrame IDs and delimiter from the config
-            input_df_id = config.get("input_df_id")
-            output_df_id = config.get("output_df_id")
-            sql_file_path = config.get("sql_file")
-            delimiter = config.get("delimiter", ",")
-
-            logger.info(f"Delimiter provided: '{delimiter}'.")
-
-            # Validate that the input DataFrame exists in the TaskSnapshot
-            input_df = snapshots.get_snapshot(input_df_id)
-            if input_df is None:
-                raise TransformationFailedError(f"Input DataFrame '{input_df_id}' not found in TaskSnapshot.")
-
-            logger.info(f"Input DataFrame '{input_df_id}' found. Proceeding with transformation.")
-
-            # Analyze the input DataFrame for optimizations
-            logger.info("Analyzing DataFrame partitions and size...")
-            input_df_size = input_df.count()
-            logger.info(f"Input DataFrame size: {input_df_size} rows.")
-
-            # Load SQL query from file
-            logger.info("Loading SQL query from file...")
-            with open(sql_file_path, 'r') as sql_file:
-                sql_query = sql_file.read()
-
-            logger.info("SQL query loaded successfully.")
-
-            # Optimize: Apply broadcast join hint if needed
-            if input_df_size < 1000000:  # Example threshold for a small DataFrame
-                logger.info("Applying broadcast join hint for optimization...")
-                input_df = input_df.hint("broadcast")
-
-            # Register input DataFrame as a temporary view for SQL execution
-            input_df.createOrReplaceTempView(input_df_id)
-
-            # Analyze the logical and physical plans for debugging and optimization
-            logger.info("Analyzing logical and physical plans...")
-            logical_plan = spark.sql(sql_query).queryExecution.logical
-            physical_plan = spark.sql(sql_query).queryExecution.executedPlan
-            logger.info(f"Logical Plan:\n{logical_plan}")
-            logger.info(f"Physical Plan:\n{physical_plan}")
-
-            # Execute the SQL query
-            logger.info(f"Executing SQL query on input DataFrame '{input_df_id}'.")
-            transformed_df = spark.sql(sql_query)
-            logger.info("SQL query executed successfully.")
-
-            # Add the transformed DataFrame to the snapshot with the output ID
-            snapshots.add_snapshot(output_df_id, transformed_df)
-            logger.info(f"Transformed DataFrame added to TaskSnapshot with ID '{output_df_id}'.")
-
-        except Exception as e:
-            # Catch any errors during execution and update the status
-            logger.error(f"Transformation task failed: {str(e)}")
-            status = TaskStatus.FAILED, e
-
-        return status
-
-    def is_executable(self) -> bool:
-        """
-        Determine if the task is executable based on the current status.
-        The task will execute if the pipeline has not failed.
-
-        :return: Boolean indicating executability of the task.
-        """
-        return self.snapshot_instance.status != TaskStatus.FAILED
+Start
+  |
+  v
+Extract Configurations (`execute`)
+- Fetch configurations from `task_config`:
+  - `inputDataFrame` (comma-separated DataFrame IDs).
+  - `outputDataFrame` (output DataFrame ID).
+  - `sqlFile` (path to the SQL file containing transformation logic).
+  - `delimiter` (default: ",").
+  - `continueOnMissing` (default: False).
+  - Log these details for reference.
+  |
+  v
+Split Input DataFrame IDs (`execute`)
+- Split the `inputDataFrame` string into individual DataFrame IDs using the delimiter.
+  |
+  v
+Check if All Input DataFrames Exist (`execute`)
+- Verify if all input DataFrames exist using `snapshots.get_snapshot`.
+  - If any DataFrame is missing:
+    - Raise a `TransformationFailedError` if `continueOnMissing` is `False`.
+    - Log a warning and continue if `continueOnMissing` is `True`.
+  |
+  +--------------------------------------+
+  |                                      |
+  v                                      v
+All DataFrames Exist?                Missing DataFrame
+(`execute`)                          (`execute`)
+  |                                      |
+  v                                      v
+Create Temporary Views               Continue or Fail
+and Optimize Input DataFrames        (Based on `continueOnMissing`)
+(`execute`)
+- For each available DataFrame:
+  - Create a temporary SQL view.
+  - Apply optimizations based on size:
+    - Small (< 1M rows): Use `broadcast` and `persist`.
+    - Medium: Repartition for parallelism.
+    - Large (> 1B rows): Use `coalesce`.
+  - Log logical and physical Spark plans using `input_df.explain`.
+  |
+  v
+Read SQL File (`execute`)
+- Read the SQL query from the specified `sqlFile`.
+  |
+  v
+Execute SQL Query (`spark.sql`)
+- Execute the SQL query on the input views to produce a transformed DataFrame.
+  |
+  v
+Show Logical and Physical Plans (`transformed_df.explain`)
+- Log Spark's logical and physical plans for debugging and performance analysis.
+  |
+  v
+Persist Transformed DataFrame (`transformed_df.persist`)
+- Cache the transformed DataFrame using `MEMORY_AND_DISK`.
+- Trigger persistence with an action (`transformed_df.count()`).
+  |
+  v
+Add Transformed DataFrame to Snapshots (`snapshots.add_snapshot`)
+- Save the transformed DataFrame to the snapshot store for future tasks.
+  |
+  v
+End
+  |
+  v
+Error Handling
+  - Catch specific errors:
+    - `PySparkRuntimeError`: Log and return `TaskStatus.FAILED`.
+    - `TransformationFailedError`: Log and return `TaskStatus.FAILED`.
+  - Catch all other exceptions, log them, and return `TaskStatus.FAILED`.
