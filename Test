@@ -1,88 +1,78 @@
-from pyspark.sql import SparkSession
 from pyspark.sql.utils import AnalysisException
-import json
-import logging
-import time
+from edh_ingestion_modules.models.task import Task
+from edh_ingestion_modules.models.task_status import TaskStatus
 
-# Initialize Spark Session
-spark = SparkSession.builder \
-    .appName("Dynamic SQL Transformation Pipeline") \
-    .getOrCreate()
 
-# Set logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+class TransformationTask(Task):
+    def __init__(self, task_config: dict):
+        """
+        Initializes the TransformationTask with the task configuration.
 
-# Load configuration
-def load_sql_config(config_path):
-    """
-    Loads the SQL transformation rules from a JSON configuration file.
-    """
-    with open(config_path, "r") as config_file:
-        return json.load(config_file)
+        Args:
+            task_config (dict): Configuration containing task-specific parameters.
+        """
+        self.task_id = task_config.get("taskId")
+        self.input_df_id = task_config.get("input_df_id")
+        self.output_df_id = task_config.get("output_df_id")
+        self.sql_file = task_config.get("sql_file")
+        self.delimiter = task_config.get("delimiter", ",")
 
-# Read input data
-def read_source_data(spark, input_path):
-    """
-    Reads the source data into a DataFrame.
-    """
-    return spark.read.parquet(input_path)
+    def execute(self):
+        """
+        Executes the transformation task:
+        - Reads the input DataFrame from the snapshot.
+        - Applies the transformation SQL query.
+        - Saves the transformed DataFrame back to the snapshot.
 
-# Apply SQL Transformation
-def apply_sql_transformation(source_df, sql_query):
-    """
-    Applies the provided SQL transformation to the source DataFrame.
-    """
-    source_df.createOrReplaceTempView("customer_data")
-    return spark.sql(sql_query)
+        Returns:
+            tuple: TaskStatus and error (if any).
+        """
+        # Get Spark session, logger, and snapshots
+        spark = self.spark_instance
+        logger = self.logger_instance
+        snapshots = self.snapshot_instance
 
-# Write output data
-def write_output_data(target_df, output_path):
-    """
-    Writes the transformed DataFrame to a target location in Parquet format.
-    """
-    target_df.write.mode("overwrite").parquet(output_path)
+        try:
+            # Check for required configurations
+            if not self.input_df_id or not self.output_df_id or not self.sql_file:
+                raise ValueError("Required configurations 'input_df_id', 'output_df_id', or 'sql_file' are missing.")
 
-# Log errors
-def log_error(error_description):
-    """
-    Logs errors to a separate file or table.
-    """
-    error_timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    logger.error(f"Error at {error_timestamp}: {error_description}")
+            logger.info(f"Starting TransformationTask with ID: {self.task_id}")
+            logger.info(f"Fetching input DataFrame '{self.input_df_id}' from snapshot...")
+            input_df = snapshots.get_snapshot(self.input_df_id)
 
-# Main pipeline
-def transformation_pipeline(config_path, input_path, output_path, error_log_path):
-    """
-    Main transformation pipeline function.
-    """
-    try:
-        # Load SQL transformation rules
-        config = load_sql_config(config_path)
-        sql_query = config["sql_query"]
+            if not input_df:
+                raise ValueError(f"Input DataFrame '{self.input_df_id}' not found in snapshot.")
 
-        # Read source data
-        source_df = read_source_data(spark, input_path)
-        logger.info("Source data loaded successfully.")
+            # Load SQL query from the file
+            logger.info(f"Loading SQL query from: {self.sql_file}")
+            with open(self.sql_file, "r") as f:
+                sql_query = f.read()
 
-        # Apply SQL Transformation
-        target_df = apply_sql_transformation(source_df, sql_query)
-        logger.info("SQL transformation applied successfully.")
+            # Repartition for optimization (optional)
+            input_df = input_df.repartition(200)
 
-        # Write output data
-        write_output_data(target_df, output_path)
-        logger.info(f"Transformed data written to {output_path} successfully.")
+            # Create a temporary view for SQL processing
+            logger.info("Creating temporary view for SQL transformation...")
+            input_df.createOrReplaceTempView("input_table")
 
-    except AnalysisException as e:
-        log_error(f"SQL AnalysisException: {str(e)}")
-    except Exception as e:
-        log_error(f"Unexpected error: {str(e)}")
+            # Execute the SQL transformation
+            logger.info("Executing SQL transformation...")
+            transformed_df = spark.sql(sql_query)
 
-# Example Usage
-if __name__ == "__main__":
-    CONFIG_PATH = "path/to/config.json"  # Path to SQL config file
-    INPUT_PATH = "path/to/input_data"    # Path to input Parquet file
-    OUTPUT_PATH = "path/to/output_data"  # Path to save output Parquet file
-    ERROR_LOG_PATH = "path/to/error_log" # Path to save error logs
+            # Persist the transformed DataFrame
+            transformed_df = transformed_df.persist()
 
-    transformation_pipeline(CONFIG_PATH, INPUT_PATH, OUTPUT_PATH, ERROR_LOG_PATH)
+            # Save the transformed DataFrame to the snapshot
+            logger.info(f"Saving transformed DataFrame to snapshot with ID: {self.output_df_id}")
+            snapshots.add_snapshot(self.output_df_id, transformed_df)
+
+            logger.info(f"TransformationTask with ID '{self.task_id}' completed successfully.")
+            return TaskStatus.SUCCESS, None
+
+        except AnalysisException as exc:
+            logger.warning(f"SQL execution failed in task '{self.task_id}': {exc}")
+            return TaskStatus.FAILED, exc
+        except Exception as exc:
+            logger.warning(f"An error occurred in TransformationTask '{self.task_id}': {exc}")
+            return TaskStatus.FAILED, exc
