@@ -1,4 +1,6 @@
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import broadcast
+from pyspark.storagelevel import StorageLevel
 from pyspark.errors import PySparkRuntimeError
 from edh_ingestion_modules.models.task import Task
 from edh_ingestion_modules.models.task_status import TaskStatus
@@ -7,7 +9,7 @@ from edh_ingestion_modules.utilities.exceptions import TransformationFailedError
 
 class TransformationTask(Task):
     """
-    A task to transform data using SQL queries, processing a single input DataFrame.
+    A task to transform data using SQL queries, optimized with Spark plans and persistence.
 
     Configuration:
     - taskId: TransformationTask
@@ -18,20 +20,10 @@ class TransformationTask(Task):
     """
 
     def __init__(self, task_config: dict):
-        """
-        Initializes the TransformationTask with the provided configuration.
-        """
         self.task_config = task_config
         self.task_id = task_config.get("taskId")
 
     def execute(self):
-        """
-        Executes the transformation task.
-
-        Returns:
-            - TaskStatus.SUCCESS if the transformation is successful.
-            - TaskStatus.FAILED if an error occurs.
-        """
         spark = self.spark_instance
         logger = self.logger_instance
         snapshots = self.snapshot_instance
@@ -58,8 +50,26 @@ class TransformationTask(Task):
                         f"Required DataFrame '{input_df_id}' is missing and continueOnMissing is False."
                     )
                 else:
-                    logger.info(f"Continuing without executing transformation as continueOnMissing is True.")
+                    logger.info("Continuing without executing transformation as continueOnMissing is True.")
                     return TaskStatus.SUCCESS, None
+
+            # Analyze DataFrame size and apply optimizations
+            input_df_count = input_df.count()
+            logger.info(f"Input DataFrame '{input_df_id}' has {input_df_count} records.")
+
+            if input_df_count < 1_000_000:
+                logger.info("Applying broadcast hint and caching for small DataFrame.")
+                input_df = broadcast(input_df).persist(StorageLevel.MEMORY_AND_DISK)
+            elif input_df_count > 1_000_000_000:
+                logger.info("Applying coalesce for large DataFrame.")
+                input_df = input_df.coalesce(spark.sparkContext.defaultParallelism * 2)
+            else:
+                logger.info("Repartitioning for medium-sized DataFrame.")
+                input_df = input_df.repartition(spark.sparkContext.defaultParallelism * 4)
+
+            # Show the Spark plans for debugging and optimization
+            logger.info("Logical and Physical Plans for the Input DataFrame:")
+            input_df.explain(extended=True)
 
             # Create a temporary view for the input DataFrame
             input_df.createOrReplaceTempView(input_df_id)
@@ -71,6 +81,15 @@ class TransformationTask(Task):
 
             logger.info("Executing SQL Query...")
             transformed_df = spark.sql(sql_query)
+
+            # Show the Spark plans for the transformed DataFrame
+            logger.info("Logical and Physical Plans for the Transformed DataFrame:")
+            transformed_df.explain(extended=True)
+
+            # Persist the transformed DataFrame
+            transformed_df.persist(StorageLevel.MEMORY_AND_DISK)
+            transformed_df.count()  # Trigger an action to persist the DataFrame
+            logger.info("Transformed DataFrame persisted successfully.")
 
             # Add the transformed DataFrame to snapshots
             snapshots.add_snapshot(output_df_id, transformed_df)
