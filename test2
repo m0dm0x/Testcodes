@@ -1,135 +1,197 @@
-import json
-import yaml
-import gcsfs
-import time
-import logging
 from pyspark.sql import SparkSession
-from pyspark.sql.utils import AnalysisException
+from pyspark.sql.functions import broadcast
+from pyspark.storagelevel import StorageLevel
+from pyspark.errors import PySparkRuntimeError
+from edh_ingestion_modules.models.task import Task
+from edh_ingestion_modules.models.task_status import TaskStatus
+from edh_ingestion_modules.utilities.exceptions import TransformationFailedError
+from gcs_read_write import GCSReadWrite
 
 
-class GCSClientSingleton:
+class TransformationTask(Task):
     """
-    Singleton class to manage GCS client connection.
-    Ensures a single instance of the GCSFileSystem is created.
+    A PySpark-based data transformation task using SQL queries.
+
+    This task performs transformations on one or more input DataFrames using a SQL query provided in an external file.
+    It supports data persistence, Spark query optimization, and dynamic input validation. The task integrates with
+    Google Cloud Storage (GCS) for reading SQL files and includes robust error handling.
+
+    **Features:**
+    - **Input Validation:** Checks the availability of required input DataFrames.
+    - **SQL Execution:** Reads SQL queries from a GCS file and executes them.
+    - **Optimizations:** Dynamically applies Spark optimizations (e.g., broadcast, repartition, coalesce) based on DataFrame size.
+    - **Persistence:** Persists the transformed DataFrame for efficient storage.
+    - **Error Handling:** Handles Spark and task-specific errors gracefully.
+
+    Attributes:
+        task_config (dict): Configuration dictionary containing task parameters.
+        gcs_reader (GCSReadWrite): Instance to handle SQL file operations.
     """
-    _instance = None
 
-    @staticmethod
-    def get_instance():
-        if GCSClientSingleton._instance is None:
-            GCSClientSingleton._instance = gcsfs.GCSFileSystem()
-        return GCSClientSingleton._instance
-
-
-class PySparkTransformationPipeline:
-    def __init__(self, config_gcs_path, input_gcs_path, output_gcs_path, error_gcs_path):
-        self.spark = SparkSession.builder.appName("Dynamic SQL Transformation Pipeline with GCS").getOrCreate()
-        self.config_gcs_path = config_gcs_path
-        self.input_gcs_path = input_gcs_path
-        self.output_gcs_path = output_gcs_path
-        self.error_gcs_path = error_gcs_path
-        self.logger = logging.getLogger(__name__)
-        logging.basicConfig(level=logging.INFO)
-        self.gcs_client = GCSClientSingleton.get_instance()
-
-    def load_sql_config(self):
+    def __init__(self, task_config: dict):
         """
-        Loads the SQL transformation rules from a JSON or YAML configuration file in GCS.
+        Initialize the TransformationTask with task configuration.
+
+        Args:
+            task_config (dict): Configuration dictionary containing task parameters.
         """
-        try:
-            with self.gcs_client.open(self.config_gcs_path, "r") as config_file:
-                content = config_file.read()
-                if self.config_gcs_path.endswith(".json"):
-                    return json.loads(content)
-                elif self.config_gcs_path.endswith(".yaml") or self.config_gcs_path.endswith(".yml"):
-                    return yaml.safe_load(content)
+        self.task_config = task_config  # Store task configuration
+        self.task_id = task_config.get("taskId")  # Get task ID
+        self.gcs_reader = GCSReadWrite(task_config)  # Initialize GCSReadWrite for file operations
+
+    def validate_input_dataframes(self, snapshots, input_dataframe_ids, continue_on_missing):
+        """
+        Validate the availability of required input DataFrames.
+
+        Args:
+            snapshots: Snapshot instance for retrieving DataFrames.
+            input_dataframe_ids (list): List of input DataFrame IDs.
+            continue_on_missing (bool): Whether to continue if a DataFrame is missing.
+
+        Raises:
+            TransformationFailedError: If any DataFrame is missing and `continueOnMissing` is False.
+        """
+        all_exist = all(snapshots.get_snapshot(df_id) for df_id in input_dataframe_ids)
+        if not all_exist and not continue_on_missing:
+            raise TransformationFailedError(
+                "One or more required DataFrames are missing, and continueOnMissing is set to False."
+            )
+
+    def create_temp_views(self, snapshots, input_dataframe_ids, logger, continue_on_missing):
+        """
+        Create temporary views for all available input DataFrames.
+
+        Args:
+            snapshots: Snapshot instance for retrieving DataFrames.
+            input_dataframe_ids (list): List of input DataFrame IDs.
+            logger: Logger instance for logging messages.
+            continue_on_missing (bool): Whether to continue if a DataFrame is missing.
+        """
+        for df_id in input_dataframe_ids:
+            input_df = snapshots.get_snapshot(df_id)
+            if input_df:
+                logger.info(f"Creating temporary view for DataFrame: {df_id}")
+                input_df.createOrReplaceTempView(df_id)
+            elif continue_on_missing:
+                logger.warning(f"Skipping missing DataFrame: {df_id}")
+
+    def optimize_dataframes(self, snapshots, input_dataframe_ids, spark, logger):
+        """
+        Optimize DataFrames based on their size.
+
+        Args:
+            snapshots: Snapshot instance for retrieving DataFrames.
+            input_dataframe_ids (list): List of input DataFrame IDs.
+            spark: Spark session instance.
+            logger: Logger instance for logging messages.
+        """
+        for df_id in input_dataframe_ids:
+            input_df = snapshots.get_snapshot(df_id)
+            if input_df:
+                input_df_count = input_df.count()
+                logger.info(f"Input DataFrame '{df_id}' has {input_df_count} records.")
+
+                if input_df_count < 1_000_000:
+                    logger.info(f"Applying broadcast and caching for small DataFrame: {df_id}")
+                    input_df = broadcast(input_df).persist(StorageLevel.MEMORY_AND_DISK)
+                elif input_df_count > 1_000_000_000:
+                    logger.info(f"Applying coalesce for large DataFrame: {df_id}")
+                    input_df = input_df.coalesce(spark.sparkContext.defaultParallelism * 2)
                 else:
-                    raise ValueError("Unsupported configuration file format. Use JSON or YAML.")
-        except Exception as e:
-            self.log_error(f"Error loading configuration: {str(e)}")
-            raise
+                    logger.info(f"Repartitioning for medium-sized DataFrame: {df_id}")
+                    input_df = input_df.repartition(spark.sparkContext.defaultParallelism * 4)
 
-    def read_source_data(self):
+                logger.info(f"Logical and Physical Plans for Input DataFrame '{df_id}':")
+                input_df.explain(extended=True)
+
+    def read_sql_query(self, sql_file_path, logger):
         """
-        Reads the source data from GCS into a DataFrame.
+        Read the SQL query from the GCS file.
+
+        Args:
+            sql_file_path (str): Path to the SQL file in GCS.
+            logger: Logger instance for logging messages.
+
+        Returns:
+            str: The SQL query as a string.
         """
+        logger.info("Reading SQL file using GCSReadWrite...")
+        return self.gcs_reader.read(sql_file_path)
+
+    def persist_transformed_df(self, transformed_df, logger):
+        """
+        Persist the transformed DataFrame for future use.
+
+        Args:
+            transformed_df: The transformed DataFrame.
+            logger: Logger instance for logging messages.
+        """
+        logger.info("Persisting the transformed DataFrame...")
+        transformed_df.persist(StorageLevel.MEMORY_AND_DISK)
+        transformed_df.count()  # Trigger an action to persist the DataFrame
+        logger.info("Transformed DataFrame persisted successfully.")
+
+    def execute(self):
+        """
+        Execute the transformation task.
+
+        Returns:
+            tuple: TaskStatus (SUCCESS/FAILED) and an optional exception.
+        """
+        # Initialize Spark, logger, and snapshot instances
+        spark = self.spark_instance
+        logger = self.logger_instance
+        snapshots = self.snapshot_instance
+
         try:
-            df = self.spark.read.parquet(self.input_gcs_path)
-            self.logger.info("Source data loaded successfully.")
-            return df
-        except Exception as e:
-            self.log_error(f"Error reading source data: {str(e)}")
-            raise
+            # Extract task configurations
+            input_dataframes = self.task_config.get("inputDataFrame")
+            output_dataframe = self.task_config.get("outputDataFrame")
+            sql_file_path = self.task_config.get("sqlFile")
+            delimiter = self.task_config.get("delimiter", ",")
+            continue_on_missing = self.task_config.get("continueOnMissing", False)
 
-    def apply_sql_transformation(self, source_df, sql_query):
-        """
-        Applies the provided SQL transformation to the source DataFrame.
-        """
-        try:
-            source_df.createOrReplaceTempView("customer_data")
-            target_df = self.spark.sql(sql_query)
-            self.logger.info("SQL transformation applied successfully.")
-            return target_df
-        except AnalysisException as e:
-            self.log_error(f"SQL AnalysisException: {str(e)}")
-            raise
-        except Exception as e:
-            self.log_error(f"Unexpected error during SQL transformation: {str(e)}")
-            raise
+            logger.info(f"Starting TransformationTask with taskId: {self.task_id}")
 
-    def write_output_data(self, target_df):
-        """
-        Writes the transformed DataFrame to GCS in Parquet format.
-        """
-        try:
-            target_df.write.mode("overwrite").parquet(self.output_gcs_path)
-            self.logger.info(f"Transformed data written to {self.output_gcs_path} successfully.")
-        except Exception as e:
-            self.log_error(f"Error writing output data: {str(e)}")
-            raise
+            # Step 1: Parse input DataFrame IDs
+            input_dataframe_ids = input_dataframes.split(delimiter)
 
-    def log_error(self, error_description):
-        """
-        Logs errors to a specified GCS path.
-        """
-        try:
-            error_timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            error_message = f"Error at {error_timestamp}: {error_description}\n"
-            self.spark.createDataFrame([(error_message,)], ["error"]).write.mode("append").text(self.error_gcs_path)
-        except Exception as e:
-            self.logger.error(f"Error logging the error: {str(e)}")
+            # Step 2: Validate input DataFrames
+            self.validate_input_dataframes(snapshots, input_dataframe_ids, continue_on_missing)
 
-    def run_pipeline(self):
-        """
-        Executes the full transformation pipeline.
-        """
-        try:
-            # Load SQL transformation rules
-            config = self.load_sql_config()
-            sql_query = config.get("sql_query")
-            if not sql_query:
-                raise ValueError("SQL query not found in the configuration file.")
+            # Step 3: Create temporary views
+            self.create_temp_views(snapshots, input_dataframe_ids, logger, continue_on_missing)
 
-            # Read source data
-            source_df = self.read_source_data()
+            # Step 4: Optimize DataFrames
+            self.optimize_dataframes(snapshots, input_dataframe_ids, spark, logger)
 
-            # Apply SQL Transformation
-            target_df = self.apply_sql_transformation(source_df, sql_query)
+            # Step 5: Read SQL query
+            sql_query = self.read_sql_query(sql_file_path, logger)
 
-            # Write output data
-            self.write_output_data(target_df)
+            # Step 6: Execute the SQL query
+            logger.info("Executing SQL Query...")
+            transformed_df = spark.sql(sql_query)
+
+            logger.info("Logical and Physical Plans for the Transformed DataFrame:")
+            transformed_df.explain(extended=True)
+
+            # Step 7: Persist the transformed DataFrame
+            self.persist_transformed_df(transformed_df, logger)
+
+            # Step 8: Add the transformed DataFrame to snapshots
+            snapshots.add_snapshot(output_dataframe, transformed_df)
+            logger.info(f"Transformation completed successfully. Output saved as: {output_dataframe}")
+
+            return TaskStatus.SUCCESS, None
+
+        except PySparkRuntimeError as e:
+            logger.error(f"PySpark Runtime Error: {str(e)}")
+            return TaskStatus.FAILED, e
+
+        except TransformationFailedError as e:
+            logger.error(f"Transformation Failed Error: {str(e)}")
+            return TaskStatus.FAILED, e
 
         except Exception as e:
-            self.log_error(f"Pipeline execution failed: {str(e)}")
-            raise
-
-
-# Example Usage
-if __name__ == "__main__":
-    CONFIG_GCS_PATH = "gs://your-bucket-name/config/config.json"  # Path to SQL config file in GCS (JSON or YAML)
-    INPUT_GCS_PATH = "gs://your-bucket-name/input_data"           # Path to input Parquet file in GCS
-    OUTPUT_GCS_PATH = "gs://your-bucket-name/output_data"         # Path to save output Parquet file in GCS
-    ERROR_GCS_PATH = "gs://your-bucket-name/error_logs"           # Path to save error logs in GCS
-
-    pipeline = PySparkTransformationPipeline(CONFIG_GCS_PATH, INPUT_GCS_PATH, OUTPUT_GCS_PATH, ERROR_GCS_PATH)
-    pipeline.run_pipeline()
+            logger.error(f"Unexpected Error: {str(e)}")
+            return TaskStatus.FAILED, e
