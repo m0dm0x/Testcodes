@@ -13,19 +13,7 @@ class TransformationTask(Task):
     A PySpark-based data transformation task using SQL queries.
 
     This task performs transformations on one or more input DataFrames using a SQL query provided in an external file.
-    It supports data persistence, Spark query optimization, and dynamic input validation. The task integrates with
-    Google Cloud Storage (GCS) for reading SQL files and includes robust error handling.
-
-    **Features:**
-    - **Input Validation:** Checks the availability of required input DataFrames.
-    - **SQL Execution:** Reads SQL queries from a GCS file and executes them.
-    - **Optimizations:** Dynamically applies Spark optimizations (e.g., broadcast, repartition, coalesce) based on DataFrame size.
-    - **Persistence:** Persists the transformed DataFrame for efficient storage.
-    - **Error Handling:** Handles Spark and task-specific errors gracefully.
-
-    Attributes:
-        task_config (dict): Configuration dictionary containing task parameters.
-        gcs_reader (GCSReadWrite): Instance to handle SQL file operations.
+    It supports data persistence, Spark query optimization, and dynamic input validation.
     """
 
     def __init__(self, task_config: dict):
@@ -35,11 +23,11 @@ class TransformationTask(Task):
         Args:
             task_config (dict): Configuration dictionary containing task parameters.
         """
-        self.task_config = task_config  # Store task configuration
-        self.task_id = task_config.get("taskId")  # Get task ID
-        self.gcs_reader = GCSReadWrite(task_config)  # Initialize GCSReadWrite for file operations
+        self.task_config = task_config
+        self.task_id = task_config.get("taskId")
+        self.gcs_reader = GCSReadWrite(task_config)
 
-    def validate_input_dataframes(self, snapshots, input_dataframe_ids, continue_on_missing):
+    def validate_input_dataframes(self, snapshots, input_dataframe_ids, continue_on_missing, logger):
         """
         Validate the availability of required input DataFrames.
 
@@ -47,19 +35,21 @@ class TransformationTask(Task):
             snapshots: Snapshot instance for retrieving DataFrames.
             input_dataframe_ids (list): List of input DataFrame IDs.
             continue_on_missing (bool): Whether to continue if a DataFrame is missing.
+            logger: Logger instance for logging messages.
 
         Raises:
-            TransformationFailedError: If any DataFrame is missing and `continueOnMissing` is False.
+            TransformationFailedError: If any DataFrame is missing and continueOnMissing is False.
         """
-        all_exist = all(snapshots.get_snapshot(df_id) for df_id in input_dataframe_ids)
-        if not all_exist and not continue_on_missing:
-            raise TransformationFailedError(
-                "One or more required DataFrames are missing, and continueOnMissing is set to False."
-            )
+        missing_dataframes = [df_id for df_id in input_dataframe_ids if snapshots.get_snapshot(df_id) is None]
+
+        if missing_dataframes:
+            logger.warning(f"Missing DataFrames: {missing_dataframes}")
+            if not continue_on_missing:
+                raise TransformationFailedError("Missing required DataFrames and continueOnMissing is False.")
 
     def create_temp_views(self, snapshots, input_dataframe_ids, logger, continue_on_missing):
         """
-        Create temporary views for all available input DataFrames.
+        Create temporary views for available input DataFrames.
 
         Args:
             snapshots: Snapshot instance for retrieving DataFrames.
@@ -73,7 +63,7 @@ class TransformationTask(Task):
                 logger.info(f"Creating temporary view for DataFrame: {df_id}")
                 input_df.createOrReplaceTempView(df_id)
             elif continue_on_missing:
-                logger.warning(f"Skipping missing DataFrame: {df_id}")
+                logger.warning(f"Skipping creation of view for missing DataFrame: {df_id}")
 
     def optimize_dataframes(self, snapshots, input_dataframe_ids, spark, logger):
         """
@@ -133,7 +123,7 @@ class TransformationTask(Task):
 
     def execute(self):
         """
-        Execute the transformation task.
+        Execute the transformation task with continueOnMissing logic.
 
         Returns:
             tuple: TaskStatus (SUCCESS/FAILED) and an optional exception.
@@ -157,7 +147,7 @@ class TransformationTask(Task):
             input_dataframe_ids = input_dataframes.split(delimiter)
 
             # Step 2: Validate input DataFrames
-            self.validate_input_dataframes(snapshots, input_dataframe_ids, continue_on_missing)
+            self.validate_input_dataframes(snapshots, input_dataframe_ids, continue_on_missing, logger)
 
             # Step 3: Create temporary views
             self.create_temp_views(snapshots, input_dataframe_ids, logger, continue_on_missing)
@@ -172,8 +162,10 @@ class TransformationTask(Task):
             logger.info("Executing SQL Query...")
             transformed_df = spark.sql(sql_query)
 
-            logger.info("Logical and Physical Plans for the Transformed DataFrame:")
-            transformed_df.explain(extended=True)
+            # Check if the transformed DataFrame is empty (edge case)
+            if transformed_df.rdd.isEmpty():
+                logger.warning("The SQL query result is empty. Skipping persistence.")
+                return TaskStatus.SUCCESS, None
 
             # Step 7: Persist the transformed DataFrame
             self.persist_transformed_df(transformed_df, logger)
