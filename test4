@@ -1,131 +1,107 @@
-from pyspark.sql import SparkSession
 from pyspark.sql.functions import broadcast
 from pyspark.storagelevel import StorageLevel
-from pyspark.errors import PySparkRuntimeError
+
 from edh_ingestion_modules.models.task import Task
 from edh_ingestion_modules.models.task_status import TaskStatus
+from edh_ingestion_modules.services.gcs_read_write import read_generic_file_from_gcs
+from edh_ingestion_modules.utilities.logging_utility import EdhPySparkLogger
+from edh_ingestion_modules.utilities.spark_utility import EdhPySparkSingleton
+from edh_ingestion_modules.utilities.task_snapshot_utility import TaskSnapshot
 from edh_ingestion_modules.utilities.exceptions import TransformationFailedError
 
 
 class TransformationTask(Task):
-    """
-    A task to transform data using SQL queries, optimized with Spark plans and persistence.
-
-    Configuration:
-    - taskId: TransformationTask
-    - inputDataFrame: Comma-separated list of input DataFrame IDs (e.g., "df1,df2").
-    - delimiter: Delimiter for separating input DataFrame IDs (default: ",").
-    - sqlFile: Path to the SQL file containing transformation logic.
-    - outputDataFrame: ID to save the transformed DataFrame.
-    - continueOnMissing: Flag to determine whether to proceed if the input DataFrame is missing (default: False).
-    - showPlans: Flag to determine whether to explain Logical and Physical Plans for DataFrames (default: False).
-    - checkTransformedSchemaAndCount: Flag to determine whether to check schema and row count of the transformed DataFrame (default: False).
-    """
 
     def __init__(self, task_config: dict):
         self.task_config = task_config
         self.task_id = task_config.get("taskId")
 
+    def validate_input_dataframes(self, snapshots, df_list, continue_on_missing, logger):
+        self.all_exist = all(snapshots.get_snapshot(df_id) for df_id in df_list)
+        logger.info(f"All exist: {self.all_exist}")
+
+        if not continue_on_missing and self.all_exist:
+            self.input_dataframe_ids = df_list
+        elif continue_on_missing and not self.all_exist:
+            self.input_dataframe_ids = []
+            for df_id in df_list:
+                snapshot = snapshots.get_snapshot(df_id)
+                if snapshot is not None:
+                    self.input_dataframe_ids.append(df_id)
+        else:
+            logger.info("Error in input DataFrame IDs")
+
+    def process_dataframes(self, snapshots, logger, continue_on_missing, input_dataframe_ids):
+        # Create temporary views for all available input DataFrames
+        for df_id in self.input_dataframe_ids:
+            input_df = snapshots.get_snapshot(df_id)
+            if input_df:
+                logger.info(f"Creating temporary view for DataFrame: {df_id}")
+                input_df.createOrReplaceTempView(df_id)
+            elif continue_on_missing:
+                logger.warning(f"Skipping missing DataFrame: {df_id}")
+
+    def optimize_dataframes(self, snapshots, input_dataframe_ids, spark, logger):
+        for df_id in input_dataframe_ids:
+            input_df = snapshots.get_snapshot(df_id)
+            if input_df:
+                input_df_count = input_df.count()
+                logger.info(f"Input DataFrame '{df_id}' has {input_df_count} records.")
+
+                if input_df_count < 1_000_000:
+                    logger.info(f"Applying broadcast hint and caching for small DataFrame: {df_id}")
+                    input_df = broadcast(input_df).persist(StorageLevel.MEMORY_AND_DISK)
+                elif input_df_count > 1_000_000_000:
+                    logger.info(f"Applying coalesce for large DataFrame: {df_id}")
+                    input_df = input_df.coalesce(spark.sparkContext.defaultParallelism * 2)
+                else:
+                    logger.info(f"Repartitioning for medium-sized DataFrame: {df_id}")
+                    input_df = input_df.repartition(spark.sparkContext.defaultParallelism * 4)
+
+                # Unpersist Input DataFrames
+                input_df.unpersist(blocking=True)
+                logger.info(f"The persisted DataFrame '{df_id}' has been unpersisted.")
+
     def execute(self):
-        spark = self.spark_instance
-        logger = self.logger_instance
-        snapshots = self.snapshot_instance
+        self.input_dataframe_ids = []
+        status = TaskStatus.SUCCESS, None
+        spark = EdhPySparkSingleton.get_instance()
+        logger = EdhPySparkLogger.get_instance()
+        snapshots = TaskSnapshot.get_instance()
 
         try:
             # Extract configurations
-            input_dataframes = self.task_config.get("inputDataFrame")
+            input_dataframe = self.task_config.get("inputDataFrame")
             output_dataframe = self.task_config.get("outputDataFrame")
-            sql_file = self.task_config.get("sqlFile")
+            sql_file_path = self.task_config.get("sqlFile")
             delimiter = self.task_config.get("delimiter", ",")  # Default delimiter is ","
-            continue_on_missing = self.task_config.get("continueOnMissing", False)
-            show_plans = self.task_config.get("showPlans", False)  # Default is False
-            check_transformed_schema = self.task_config.get("checkTransformedSchemaAndCount", False)  # Default is False
+            continue_on_missing = self.task_config.get("continueOnMissing", False)  # Default is False
 
-            logger.info(f"Starting TransformationTask with taskId: {self.task_id}")
-            logger.info(f"Input DataFrames: {input_dataframes}")
-            logger.info(f"Delimiter: {delimiter}")
-            logger.info(f"SQL File Path: {sql_file}")
-            logger.info(f"Output DataFrame: {output_dataframe}")
-            logger.info(f"Continue On Missing: {continue_on_missing}")
-            logger.info(f"Show Logical/Physical Plans: {show_plans}")
-            logger.info(f"Check Transformed Schema/Count: {check_transformed_schema}")
+            # Step 1: Split the input DataFrame IDs using the delimiter
+            df_list = input_dataframe.split(delimiter) if delimiter else [input_dataframe]
+            logger.info(f"df_list: {df_list}")
 
-            # Split the input DataFrame IDs using the delimiter, or treat as a single DataFrame if no delimiter provided
-            input_dataframe_ids = input_dataframes.split(delimiter) if delimiter else [input_dataframes]
+            # Step 2: Validate input DataFrames
+            self.validate_input_dataframes(snapshots, df_list, continue_on_missing, logger)
 
-            # Check if all required input DataFrames exist
-            all_exist = all(snapshots.get_snapshot(df_id) for df_id in input_dataframe_ids)
-            if not all_exist and not continue_on_missing:
-                raise TransformationFailedError(
-                    f"One or more required DataFrames are missing and continueOnMissing is False."
-                )
+            # Step 3: Read SQL query from GCS file
+            bucket_name, generic_file_path = sql_file_path.split("/", 1)
+            sql_query = read_generic_file_from_gcs(bucket_name=bucket_name, generic_file_path=generic_file_path)
 
-            # Create temporary views for all available input DataFrames
-            for df_id in input_dataframe_ids:
-                input_df = snapshots.get_snapshot(df_id)
-                if input_df:
-                    logger.info(f"Creating temporary view for DataFrame: {df_id}")
-                    input_df.createOrReplaceTempView(df_id)
-                elif continue_on_missing:
-                    logger.warning(f"Skipping missing DataFrame: {df_id}")
+            # Step 4: Create temporary views
+            self.process_dataframes(snapshots, logger, continue_on_missing, self.input_dataframe_ids)
 
-            # Analyze DataFrame size and apply optimizations for each input DataFrame
-            for df_id in input_dataframe_ids:
-                input_df = snapshots.get_snapshot(df_id)
-                if input_df:
-                    input_df_count = input_df.count()
-                    logger.info(f"Input DataFrame '{df_id}' has {input_df_count} records.")
-
-                    if input_df_count < 1_000_000:
-                        logger.info(f"Applying broadcast hint and caching for small DataFrame: {df_id}")
-                        input_df = broadcast(input_df).persist(StorageLevel.MEMORY_AND_DISK)
-                    elif input_df_count > 1_000_000_000:
-                        logger.info(f"Applying coalesce for large DataFrame: {df_id}")
-                        input_df = input_df.coalesce(spark.sparkContext.defaultParallelism * 2).persist(StorageLevel.MEMORY_AND_DISK)
-                    else:
-                        logger.info(f"Repartitioning for medium-sized DataFrame: {df_id}")
-                        input_df = input_df.repartition(spark.sparkContext.defaultParallelism * 4).persist(StorageLevel.MEMORY_AND_DISK)
-
-                    # Show the Logical and Physical Plans if enabled
-                    if show_plans:
-                        logger.info(f"Logical and Physical Plans for the Input DataFrame '{df_id}':")
-                        input_df.explain(extended=True)
-
-            # Read the SQL file
-            with open(sql_file, "r") as file:
-                sql_query = file.read()
-
-            logger.info("Executing SQL Query...")
+            # Step 5: Execute the SQL query
+            logger.info(f"Executing SQL Query: {sql_query}")
             transformed_df = spark.sql(sql_query)
+            transformed_df.show()
 
-            # Show the Logical and Physical Plans for the transformed DataFrame if enabled
-            if show_plans:
-                logger.info("Logical and Physical Plans for the Transformed DataFrame:")
-                transformed_df.explain(extended=True)
-
-            # Count and add schema validation for the transformed DataFrame (if configured)
-            if check_transformed_schema:
-                logger.info("Checking schema and row count for the transformed DataFrame...")
-                logger.info("Schema of Transformed DataFrame:")
-                transformed_df.printSchema()
-
-                transformed_count = transformed_df.count()
-                logger.info(f"Row count of Transformed DataFrame: {transformed_count}")
-
-            # Add the transformed DataFrame to snapshots
+            # Step 6: Add the transformed DataFrame to snapshots
             snapshots.add_snapshot(output_dataframe, transformed_df)
             logger.info(f"Transformation completed successfully. Output saved as: {output_dataframe}")
 
-            return TaskStatus.SUCCESS, None
-
-        except PySparkRuntimeError as e:
-            logger.error(f"PySpark Runtime Error: {str(e)}")
-            return TaskStatus.FAILED, e
-
-        except TransformationFailedError as e:
-            logger.error(f"Transformation Failed Error: {str(e)}")
-            return TaskStatus.FAILED, e
-
         except Exception as e:
-            logger.error(f"Unexpected Error: {str(e)}")
-            return TaskStatus.FAILED, e
+            logger.error(f"Transformation failed with error: {e}")
+            status = TaskStatus.FAILURE, str(e)
+
+        return status
