@@ -1,6 +1,14 @@
 from pyspark.sql.functions import broadcast
 from pyspark.storagelevel import StorageLevel
 
+from edh_ingestion_modules.models.task import Task
+from edh_ingestion_modules.models.task_status import TaskStatus
+from edh_ingestion_modules.services.gcs_read_write import read_generic_file_from_gcs
+from edh_ingestion_modules.utilities.logging_utility import EdhPySparkLogger
+from edh_ingestion_modules.utilities.spark_utility import EdhPySparkSingleton
+from edh_ingestion_modules.utilities.task_snapshot_utility import TaskSnapshot
+
+
 class TransformationTask(Task):
     def __init__(self, task_config: dict):
         self.task_config = task_config
@@ -62,11 +70,14 @@ class TransformationTask(Task):
 
             sql_query = read_generic_file_from_gcs(bucket, path)
 
-            validate_and_load_input(snapshots, input_df_ids, self.task_config.get("continueOnMissing", False), logger)
-            create_temp_views(snapshots, logger)
+            # Validate and load input DataFrames
+            self.validate_and_load_input(snapshots, input_df_ids, self.task_config.get("continueOnMissing", False), logger)
             
-            # Apply DataFrame optimizations
-            optimize_dataframes(snapshots, spark, logger)
+            # Create temporary views
+            self.create_temp_views(snapshots, logger)
+            
+            # Apply optimizations
+            self.optimize_dataframes(snapshots, spark, logger)
 
             logger.info("Executing SQL query...")
             transformed_df = spark.sql(sql_query)
