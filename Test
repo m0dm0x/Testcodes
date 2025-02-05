@@ -1,91 +1,196 @@
 from pyspark.sql.functions import broadcast
 from pyspark.storagelevel import StorageLevel
-
-from edh_ingestion_modules.models.task import Task
-from edh_ingestion_modules.models.task_status import TaskStatus
+from edh_ingestion_modules.models.task import Task, TaskStatus
 from edh_ingestion_modules.services.gcs_read_write import read_generic_file_from_gcs
 from edh_ingestion_modules.utilities.logging_utility import EdhPySparkLogger
 from edh_ingestion_modules.utilities.spark_utility import EdhPySparkSingleton
 from edh_ingestion_modules.utilities.task_snapshot_utility import TaskSnapshot
+from edh_ingestion_modules.utilities.exceptions import TransformationFailedError
 
 
 class TransformationTask(Task):
+    """
+    A Spark SQL transformation task handler with optimization capabilities and fault tolerance.
+    
+    Purpose:
+    Executes SQL transformations on input DataFrames with configurable Spark optimizations.
+    Handles DataFrame validation, performance tuning, and error recovery in ETL/ELT pipelines.
+    
+    Key Features:
+    - Input DataFrame validation and filtering
+    - Spark optimization pipeline (broadcasting, repartitioning, caching)
+    - GCS-based SQL query execution
+    - Configurable fault tolerance for missing inputs
+    - Snapshot-based DataFrame management
+    
+    Args:
+        task_config (dict): Configuration dictionary containing task parameters
+    
+    Configuration Parameters:
+        Required:
+            - taskId (str): Unique task identifier
+            - inputDataFrame (str): Comma-separated input DataFrame IDs
+            - outputDataFrame (str): Output DataFrame name for results
+            - sqlFile (str): GCS path to SQL transformation file
+        
+        Optional:
+            - delimiter (str, default=','): Input DataFrame ID separator
+            - continueOnMissing (str, default='false'): 'true'/'false' to continue with missing inputs
+            - spark_df_optimization (dict, default={}): Optimization instructions format:
+                {
+                    "input_df1": {
+                        "repartition": 200,
+                        "persist": {}
+                    },
+                    "input_df2": {
+                        "broadcast": {},
+                        "repartitionByRange": ["column"]
+                    }
+                }
+    
+    Supported Optimizations:
+        - persist: Cache in memory/disk (StorageLevel.MEMORY_AND_DISK)
+        - cache: Cache in memory only
+        - broadcast: Broadcast small DataFrame
+        - repartition: Repartition to N partitions (integer required)
+        - repartitionByRange: Repartition by columns (list of columns required)
+    
+    Example:
+        >>> task_config = {
+        ...     "taskId": "order-enrichment",
+        ...     "inputDataFrame": "orders,products",
+        ...     "outputDataFrame": "enriched_orders",
+        ...     "sqlFile": "my-bucket/transform.sql",
+        ...     "continueOnMissing": "true",
+        ...     "spark_df_optimization": {
+        ...         "orders": {"repartition": 200},
+        ...         "products": {"broadcast": {}}
+        ...     }
+        ... }
+        >>> task = TransformationTask(task_config)
+        >>> status, message = task.execute()
+        >>> if status == TaskStatus.SUCCESS:
+        ...     result_df = TaskSnapshot.get_instance().get_snapshot("enriched_orders")
+    
+    Raises:
+        TransformationFailedError: For critical errors in input validation, 
+                                  SQL execution, or optimization failures
+    
+    Notes:
+        - Input DataFrames must be registered in TaskSnapshot prior to execution
+        - Recommended broadcast threshold: < 100MB datasets
+        - Use persist/cache for frequently reused DataFrames
+        - Configure Spark settings appropriately:
+            spark.conf.set("spark.sql.shuffle.partitions", 200)
+            spark.conf.set("spark.sql.autoBroadcastJoinThreshold", 100*1024*1024)
+    """
+
+    OPTIMIZATION_MAP = {
+        "persist": lambda df, _: df.persist(StorageLevel.MEMORY_AND_DISK),
+        "cache": lambda df, _: df.cache(),
+        "broadcast": lambda df, _: broadcast(df),
+        "repartition": lambda df, v: df.repartition(v) if isinstance(v, int) else df,
+        "repartitionByRange": lambda df, v: df.repartitionByRange(*v) if isinstance(v, list) else df,
+    }
+
     def __init__(self, task_config: dict):
+        """Initialize transformation task with configuration dictionary"""
+        super().__init__()
         self.task_config = task_config
         self.task_id = task_config.get("taskId")
         self.input_dataframe_ids = []
 
-    def validate_and_load_input(self, snapshots, df_list, continue_on_missing, logger):
-        self.input_dataframe_ids = [df_id for df_id in df_list if snapshots.get_snapshot(df_id)] \
-            if not continue_on_missing else df_list
+    def _validate_input_dataframes(self, snapshots, df_list, continue_on_missing, logger):
+        """Validate input DataFrame availability in snapshots"""
+        existing_dfs = [df_id for df_id in df_list if snapshots.get_snapshot(df_id)]
+        
+        if continue_on_missing:
+            self.input_dataframe_ids = existing_dfs
+        else:
+            self.input_dataframe_ids = df_list if len(existing_dfs) == len(df_list) else []
+        
         logger.info(f"Validated input DataFrames: {self.input_dataframe_ids}")
+        
+        if not self.input_dataframe_ids:
+            raise TransformationFailedError("No valid input DataFrames found")
 
-    def create_temp_views(self, snapshots, logger):
-        for df_id in self.input_dataframe_ids:
-            input_df = snapshots.get_snapshot(df_id)
-            if input_df:
-                logger.info(f"Creating temporary view for DataFrame: {df_id}")
-                input_df.createOrReplaceTempView(df_id)
+    def _apply_optimizations(self, df, df_id, optimizations, logger):
+        """Apply configured optimizations to a DataFrame"""
+        for opt_type, opt_value in optimizations.items():
+            try:
+                optimizer = self.OPTIMIZATION_MAP.get(opt_type)
+                if not optimizer:
+                    logger.warning(f"Skipping unknown optimization: {opt_type}")
+                    continue
 
-    def optimize_dataframes(self, snapshots, spark, logger):
-        for df_id in self.input_dataframe_ids:
-            df = snapshots.get_snapshot(df_id)
-            if df:
-                num_partitions = df.rdd.getNumPartitions()
-                logger.info(f"DataFrame '{df_id}' has {num_partitions} partitions.")
+                optimized_df = optimizer(df, opt_value)
+                if optimized_df is not None:
+                    df = optimized_df
+                    logger.info(f"Applied {opt_type} to {df_id}")
+                else:
+                    logger.warning(f"Invalid parameters for {opt_type} on {df_id}")
+            except Exception as e:
+                logger.error(f"Optimization {opt_type} failed for {df_id}: {str(e)}")
+                raise
+        return df
 
-                # Default parallelism for optimization hint
-                default_parallelism = spark.sparkContext.defaultParallelism
+    def _process_dataframe(self, snapshots, df_id, optimizations, logger):
+        """Process individual DataFrame including optimizations and view creation"""
+        df = snapshots.get_snapshot(df_id)
+        if not df:
+            raise TransformationFailedError(f"DataFrame {df_id} not found in snapshots")
 
-                if num_partitions < default_parallelism:  # Likely small dataset
-                    logger.info(f"Broadcasting and caching small DataFrame: {df_id}")
-                    df = broadcast(df).persist(StorageLevel.MEMORY_AND_DISK)
-                elif num_partitions > 2 * default_parallelism:  # Likely large dataset
-                    logger.info(f"Coalescing large DataFrame: {df_id}")
-                    df = df.coalesce(default_parallelism)
-                else:  # Medium-sized dataset
-                    logger.info(f"Repartitioning medium DataFrame: {df_id}")
-                    df = df.repartition(default_parallelism)
-
-                # Column pruning to reduce data shuffling
-                df = df.select(*df.columns)
-                df.cache()
-                logger.info(f"Optimizations applied to DataFrame '{df_id}'")
-
-                # Unpersist after use
-                df.unpersist(blocking=True)
-                logger.info(f"Unpersisted DataFrame '{df_id}'")
+        if optimizations and isinstance(optimizations, dict):
+            df_opts = optimizations.get(df_id, {})
+            if isinstance(df_opts, dict):
+                df = self._apply_optimizations(df, df_id, df_opts, logger)
+        
+        try:
+            df.createOrReplaceTempView(df_id)
+            logger.info(f"Created temporary view for {df_id}")
+        except Exception as e:
+            logger.error(f"View creation failed for {df_id}: {str(e)}")
+            raise
 
     def execute(self):
-        status = TaskStatus.SUCCESS, None
+        """Execute the complete transformation pipeline"""
         spark = EdhPySparkSingleton.get_instance()
         logger = EdhPySparkLogger.get_instance()
         snapshots = TaskSnapshot.get_instance()
+        status = (TaskStatus.SUCCESS, None)
 
         try:
-            input_df_ids = self.task_config.get("inputDataFrame", "").split(self.task_config.get("delimiter", ","))
-            output_df = self.task_config.get("outputDataFrame")
-            sql_path = self.task_config.get("sqlFile")
-            bucket, path = sql_path.split("/", 1)
+            # Parse configuration parameters
+            input_data = self.task_config.get("inputDataFrame", "")
+            delimiter = self.task_config.get("delimiter", ",")
+            df_list = [s.strip() for s in input_data.split(delimiter)] if input_data else []
+            continue_on_missing = self.task_config.get("continueOnMissing", "false").lower() == "true"
+            optimizations = self.task_config.get("spark_df_optimization", {})
 
-            sql_query = read_generic_file_from_gcs(bucket, path)
+            # Validate input DataFrames
+            self._validate_input_dataframes(snapshots, df_list, continue_on_missing, logger)
 
-            # Validate and load input DataFrames
-            self.validate_and_load_input(snapshots, input_df_ids, self.task_config.get("continueOnMissing", False), logger)
+            # Process each DataFrame
+            for df_id in self.input_dataframe_ids:
+                self._process_dataframe(snapshots, df_id, optimizations, logger)
+
+            # Load and execute SQL transformation
+            sql_path = self.task_config.get("sqlFile", "")
+            if not sql_path:
+                raise TransformationFailedError("Missing SQL file path")
+
+            bucket, *path_parts = sql_path.split("/", 1)
+            sql_query = read_generic_file_from_gcs(bucket, path_parts[0])
             
-            # Create temporary views
-            self.create_temp_views(snapshots, logger)
-            
-            # Apply optimizations
-            self.optimize_dataframes(snapshots, spark, logger)
-
-            logger.info("Executing SQL query...")
             transformed_df = spark.sql(sql_query)
-            transformed_df.show()
+            
+            # Persist results
+            output_df = self.task_config.get("outputDataFrame")
             snapshots.add_snapshot(output_df, transformed_df)
-            logger.info(f"Transformation completed: {output_df}")
+            logger.info(f"Transformation completed. Output: {output_df}")
+
         except Exception as e:
-            logger.error(f"Transformation failed: {e}")
-            status = TaskStatus.FAILURE, str(e)
+            logger.error(f"Transformation task failed: {str(e)}", exc_info=True)
+            status = (TaskStatus.FAILED, str(e))
 
         return status
