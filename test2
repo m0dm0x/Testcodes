@@ -9,26 +9,21 @@ from edh_task_snapshot import TaskSnapshot
 
 class GetMetricsTask(Task):
     """
-    GetMetricsTask is a PySpark task designed to analyze and provide detailed insights into input DataFrames.
-    It helps in data quality checks, debugging, and general data exploration.
+    GetMetricsTask is a PySpark task that analyzes and provides insights into input DataFrames, 
+    such as schema, row counts, basic statistics, and data sampling.
 
-    The task performs the following functions:
-    1. Display DataFrame head.
-    2. Count total rows in the DataFrame.
-    3. Print the schema (columns and types).
-    4. Calculate basic statistics for numeric columns (min, max, mean, standard deviation, and null counts).
-    5. Calculate basic statistics for string columns (unique value counts, null counts, and max string length).
-    6. Summarize data types present in the DataFrame.
-    7. Output a random sample from the DataFrame.
-
-    Example Usage:
-        config = {
-            "taskId": "get_metrics_task_001",
-            "inputDataFrames": ["df1", "df2"]
+    Configuration format example:
+        {
+            "taskId": "get_metrics_task",
+            "dfIds": ["df1", "df2"],
+            "display_head": True,
+            "count_rows": True,
+            "print_schema": True,
+            "numeric_stats": True,
+            "string_stats": True,
+            "data_type_summary": True,
+            "sample_data": True
         }
-        
-        task = GetMetricsTask(config)
-        task.execute()
     """
 
     def __init__(self, config: dict):
@@ -37,115 +32,25 @@ class GetMetricsTask(Task):
 
         Args:
             config (dict): Configuration dictionary containing task-specific settings.
-                Example:
-                    {
-                        "taskId": "get_metrics_task",
-                        "inputDataFrames": ["df1", "df2"]
-                    }
         """
         self.config = config
         self.task_id = config.get("taskId")
         self.logger = EdhPySparkLogger.get_instance()
         self.snapshots = TaskSnapshot.get_instance()
 
-    def execute(self):
-        """
-        Execute the task and generate metrics for input DataFrames.
-
-        This method iterates over each DataFrame ID specified in the task configuration,
-        performs analysis, and logs the output.
-
-        Returns:
-            Tuple: Task status and message.
-        """
-        status = TaskStatus.SUCCESS, None
-
-        try:
-            # Extract DataFrame IDs from the config
-            dataframe_ids = self.config.get("inputDataFrames", [])
-
-            for df_id in dataframe_ids:
-                # Fetch DataFrame snapshot
-                df = self.snapshots.get_snapshot(df_id)
-                if not df:
-                    self.logger.warning(f"No DataFrame found for id: {df_id}")
-                    continue
-
-                self.logger.info(f"Processing DataFrame with ID: {df_id}")
-                self._display_dataframe(df)
-                self._count_rows(df)
-                self._print_schema(df)
-                self._calculate_numeric_stats(df)
-                self._calculate_string_stats(df)
-                self._data_type_summary(df)
-                self._output_sample_data(df)
-
-        except Exception as e:
-            self.logger.error(f"Task execution failed with error: {e}")
-            status = TaskStatus.FAILED, str(e)
-
-        return status
-
     def _display_dataframe(self, df, num_rows=20):
-        """
-        Display the first few rows of the DataFrame.
-
-        Args:
-            df (DataFrame): The input DataFrame.
-            num_rows (int): Number of rows to display. Default is 20.
-
-        Example:
-            df.show(20)
-        """
         self.logger.info("Displaying DataFrame head:")
         df.show(num_rows)
 
     def _count_rows(self, df):
-        """
-        Count the number of rows in the DataFrame and log the result.
-
-        Args:
-            df (DataFrame): The input DataFrame.
-
-        Example:
-            Row count: 1000
-        """
         row_count = df.count()
         self.logger.info(f"Total number of rows: {row_count}")
 
     def _print_schema(self, df):
-        """
-        Print the schema of the DataFrame.
-
-        Args:
-            df (DataFrame): The input DataFrame.
-
-        Example:
-            root
-             |-- Name: string (nullable = true)
-             |-- Age: integer (nullable = true)
-        """
         self.logger.info("DataFrame Schema:")
         df.printSchema()
 
     def _calculate_numeric_stats(self, df):
-        """
-        Calculate and log basic statistics for numeric columns.
-
-        Args:
-            df (DataFrame): The input DataFrame.
-
-        Statistics include:
-            - Minimum value
-            - Maximum value
-            - Mean
-            - Standard deviation
-            - Null value count
-
-        Example Output:
-            Numeric Column Statistics:
-            min_Age: 22, max_Age: 50, mean_Age: 35.5, stddev_Age: 5.3, null_Age: 2
-        """
         numeric_cols = [field.name for field in df.schema.fields if field.dataType.typeName() in ('integer', 'double', 'float', 'long')]
         if numeric_cols:
             self.logger.info("Numeric Column Statistics:")
@@ -163,20 +68,6 @@ class GetMetricsTask(Task):
             self.logger.info("No numeric columns found.")
 
     def _calculate_string_stats(self, df):
-        """
-        Calculate and log basic statistics for string columns.
-
-        Args:
-            df (DataFrame): The input DataFrame.
-
-        Statistics include:
-            - Approximate unique value count
-            - Null value count
-            - Maximum string length
-
-        Example Output:
-            unique_Name: 4, null_Name: 1, max_length_Name: 10
-        """
         string_cols = [field.name for field in df.schema.fields if field.dataType.typeName() == 'string']
         if string_cols:
             self.logger.info("String Column Statistics:")
@@ -191,16 +82,6 @@ class GetMetricsTask(Task):
             self.logger.info("No string columns found.")
 
     def _data_type_summary(self, df):
-        """
-        Summarize and log the types of data in the DataFrame.
-
-        Args:
-            df (DataFrame): The input DataFrame.
-
-        Example Output:
-            integer: 2 columns
-            string: 1 column
-        """
         type_counts = {}
         for field in df.schema.fields:
             data_type = field.dataType.typeName()
@@ -210,20 +91,53 @@ class GetMetricsTask(Task):
             self.logger.info(f"{data_type}: {count} columns")
 
     def _output_sample_data(self, df, sample_size=5):
-        """
-        Output a random sample of rows from the DataFrame.
-
-        Args:
-            df (DataFrame): The input DataFrame.
-            sample_size (int): Number of rows to sample. Default is 5.
-
-        Example:
-            Sample Data:
-            +-----+-----+
-            | Name|  Age|
-            +-----+-----+
-            |Alice|   25|
-            +-----+-----+
-        """
         self.logger.info("Sample Data:")
         df.orderBy(rand()).limit(sample_size).show()
+
+    def execute(self):
+        """
+        Execute the task and generate metrics for input DataFrames based on configuration flags.
+
+        Returns:
+            Tuple: Task status and message.
+        """
+        status = TaskStatus.SUCCESS, None
+
+        try:
+            dataframe_ids = self.config.get("dfIds", [])
+
+            for df_id in dataframe_ids:
+                df = self.snapshots.get_snapshot(df_id)
+                if not df:
+                    self.logger.warning(f"No DataFrame found for id: {df_id}")
+                    continue
+
+                self.logger.info(f"Processing DataFrame with ID: {df_id}")
+
+                # Execute operations based on task-level flags
+                if self.config.get("display_head", False):
+                    self._display_dataframe(df)
+
+                if self.config.get("count_rows", False):
+                    self._count_rows(df)
+
+                if self.config.get("print_schema", False):
+                    self._print_schema(df)
+
+                if self.config.get("numeric_stats", False):
+                    self._calculate_numeric_stats(df)
+
+                if self.config.get("string_stats", False):
+                    self._calculate_string_stats(df)
+
+                if self.config.get("data_type_summary", False):
+                    self._data_type_summary(df)
+
+                if self.config.get("sample_data", False):
+                    self._output_sample_data(df)
+
+        except Exception as e:
+            self.logger.error(f"Task execution failed with error: {e}")
+            status = TaskStatus.FAILED, str(e)
+
+        return status
