@@ -1,109 +1,229 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import broadcast
-from pyspark.storagelevel import StorageLevel
-from pyspark.errors import PySparkRuntimeError
-from edh_ingestion_modules.models.task import Task
-from edh_ingestion_modules.models.task_status import TaskStatus
-from edh_ingestion_modules.utilities.exceptions import TransformationFailedError
-from gcs_read_write import GCSReadWrite
+from pyspark.sql.functions import (
+    col, min, max, mean, stddev, count, approx_count_distinct, length, rand, when
+)
+from edh_pyspark_task import Task, TaskStatus
+from edh_pyspark_singleton import EdhPySparkSingleton
+from edh_pyspark_logger import EdhPySparkLogger
+from edh_task_snapshot import TaskSnapshot
 
+class GetMetricsTask(Task):
+    """
+    GetMetricsTask is a PySpark task designed to analyze and provide detailed insights into input DataFrames.
+    It helps in data quality checks, debugging, and general data exploration.
 
-class TransformationTask(Task):
-    def __init__(self, task_config: dict):
-        self.task_config = task_config
-        self.task_id = task_config.get("taskId")
-        self.gcs_reader = GCSReadWrite(task_config)
+    The task performs the following functions:
+    1. Display DataFrame head.
+    2. Count total rows in the DataFrame.
+    3. Print the schema (columns and types).
+    4. Calculate basic statistics for numeric columns (min, max, mean, standard deviation, and null counts).
+    5. Calculate basic statistics for string columns (unique value counts, null counts, and max string length).
+    6. Summarize data types present in the DataFrame.
+    7. Output a random sample from the DataFrame.
 
-    def validate_and_create_views(self, snapshots, input_dataframe_ids, continue_on_missing, logger):
+    Example Usage:
+        config = {
+            "taskId": "get_metrics_task_001",
+            "inputDataFrames": ["df1", "df2"]
+        }
+        
+        task = GetMetricsTask(config)
+        task.execute()
+    """
+
+    def __init__(self, config: dict):
         """
-        Validate the availability of input DataFrames and create views for existing ones.
+        Initialize the task with the provided configuration.
 
         Args:
-            snapshots: Snapshot instance for retrieving DataFrames.
-            input_dataframe_ids (list): List of input DataFrame IDs.
-            continue_on_missing (bool): Whether to continue if a DataFrame is missing.
-            logger: Logger instance for logging messages.
-
-        Returns:
-            list: List of valid DataFrame IDs that have been successfully loaded.
+            config (dict): Configuration dictionary containing task-specific settings.
+                Example:
+                    {
+                        "taskId": "get_metrics_task",
+                        "inputDataFrames": ["df1", "df2"]
+                    }
         """
-        available_dataframes = []
-        for df_id in input_dataframe_ids:
-            input_df = snapshots.get_snapshot(df_id)
-            if input_df:
-                logger.info(f"Creating temporary view for DataFrame: {df_id}")
-                input_df.createOrReplaceTempView(df_id)
-                available_dataframes.append(df_id)
-            else:
-                logger.warning(f"DataFrame '{df_id}' is missing.")
-        
-        if not available_dataframes:
-            raise TransformationFailedError("No available DataFrames found.")
-        
-        if len(available_dataframes) < len(input_dataframe_ids) and not continue_on_missing:
-            raise TransformationFailedError("One or more required DataFrames are missing and continueOnMissing is False.")
-        
-        return available_dataframes
+        self.config = config
+        self.task_id = config.get("taskId")
+        self.logger = EdhPySparkLogger.get_instance()
+        self.snapshots = TaskSnapshot.get_instance()
 
     def execute(self):
         """
-        Execute the transformation task with refined continueOnMissing logic.
+        Execute the task and generate metrics for input DataFrames.
+
+        This method iterates over each DataFrame ID specified in the task configuration,
+        performs analysis, and logs the output.
 
         Returns:
-            tuple: TaskStatus (SUCCESS/FAILED) and an optional exception.
+            Tuple: Task status and message.
         """
-        spark = self.spark_instance
-        logger = self.logger_instance
-        snapshots = self.snapshot_instance
+        status = TaskStatus.SUCCESS, None
 
         try:
-            input_dataframes = self.task_config.get("inputDataFrame")
-            output_dataframe = self.task_config.get("outputDataFrame")
-            sql_file_path = self.task_config.get("sqlFile")
-            delimiter = self.task_config.get("delimiter", ",")
-            continue_on_missing = self.task_config.get("continueOnMissing", False)
+            # Extract DataFrame IDs from the config
+            dataframe_ids = self.config.get("inputDataFrames", [])
 
-            logger.info(f"Starting TransformationTask with taskId: {self.task_id}")
+            for df_id in dataframe_ids:
+                # Fetch DataFrame snapshot
+                df = self.snapshots.get_snapshot(df_id)
+                if not df:
+                    self.logger.warning(f"No DataFrame found for id: {df_id}")
+                    continue
 
-            input_dataframe_ids = input_dataframes.split(delimiter)
-
-            # Step 1: Validate input DataFrames and create views for available ones
-            available_dataframes = self.validate_and_create_views(
-                snapshots, input_dataframe_ids, continue_on_missing, logger
-            )
-
-            logger.info(f"Proceeding with available DataFrames: {available_dataframes}")
-
-            # Step 2: Read SQL query
-            sql_query = self.gcs_reader.read(sql_file_path)
-
-            # Step 3: Execute the SQL query
-            logger.info("Executing SQL Query...")
-            transformed_df = spark.sql(sql_query)
-
-            if transformed_df.rdd.isEmpty():
-                logger.warning("The SQL query result is empty. Skipping persistence.")
-                return TaskStatus.SUCCESS, None
-
-            # Step 4: Persist the transformed DataFrame
-            transformed_df.persist(StorageLevel.MEMORY_AND_DISK)
-            transformed_df.count()
-            logger.info("Transformed DataFrame persisted successfully.")
-
-            # Step 5: Add the transformed DataFrame to snapshots
-            snapshots.add_snapshot(output_dataframe, transformed_df)
-            logger.info(f"Transformation completed successfully. Output saved as: {output_dataframe}")
-
-            return TaskStatus.SUCCESS, None
-
-        except PySparkRuntimeError as e:
-            logger.error(f"PySpark Runtime Error: {str(e)}")
-            return TaskStatus.FAILED, e
-
-        except TransformationFailedError as e:
-            logger.error(f"Transformation Failed Error: {str(e)}")
-            return TaskStatus.FAILED, e
+                self.logger.info(f"Processing DataFrame with ID: {df_id}")
+                self._display_dataframe(df)
+                self._count_rows(df)
+                self._print_schema(df)
+                self._calculate_numeric_stats(df)
+                self._calculate_string_stats(df)
+                self._data_type_summary(df)
+                self._output_sample_data(df)
 
         except Exception as e:
-            logger.error(f"Unexpected Error: {str(e)}")
-            return TaskStatus.FAILED, e
+            self.logger.error(f"Task execution failed with error: {e}")
+            status = TaskStatus.FAILED, str(e)
+
+        return status
+
+    def _display_dataframe(self, df, num_rows=20):
+        """
+        Display the first few rows of the DataFrame.
+
+        Args:
+            df (DataFrame): The input DataFrame.
+            num_rows (int): Number of rows to display. Default is 20.
+
+        Example:
+            df.show(20)
+        """
+        self.logger.info("Displaying DataFrame head:")
+        df.show(num_rows)
+
+    def _count_rows(self, df):
+        """
+        Count the number of rows in the DataFrame and log the result.
+
+        Args:
+            df (DataFrame): The input DataFrame.
+
+        Example:
+            Row count: 1000
+        """
+        row_count = df.count()
+        self.logger.info(f"Total number of rows: {row_count}")
+
+    def _print_schema(self, df):
+        """
+        Print the schema of the DataFrame.
+
+        Args:
+            df (DataFrame): The input DataFrame.
+
+        Example:
+            root
+             |-- Name: string (nullable = true)
+             |-- Age: integer (nullable = true)
+        """
+        self.logger.info("DataFrame Schema:")
+        df.printSchema()
+
+    def _calculate_numeric_stats(self, df):
+        """
+        Calculate and log basic statistics for numeric columns.
+
+        Args:
+            df (DataFrame): The input DataFrame.
+
+        Statistics include:
+            - Minimum value
+            - Maximum value
+            - Mean
+            - Standard deviation
+            - Null value count
+
+        Example Output:
+            Numeric Column Statistics:
+            min_Age: 22, max_Age: 50, mean_Age: 35.5, stddev_Age: 5.3, null_Age: 2
+        """
+        numeric_cols = [field.name for field in df.schema.fields if field.dataType.typeName() in ('integer', 'double', 'float', 'long')]
+        if numeric_cols:
+            self.logger.info("Numeric Column Statistics:")
+            for col_name in numeric_cols:
+                stats = df.select(
+                    min(col(col_name)).alias(f"min_{col_name}"),
+                    max(col(col_name)).alias(f"max_{col_name}"),
+                    mean(col(col_name)).alias(f"mean_{col_name}"),
+                    stddev(col(col_name)).alias(f"stddev_{col_name}"),
+                    count(col(col_name)).alias(f"non_null_{col_name}"),
+                    count(when(col(col_name).isNull(), col_name)).alias(f"null_{col_name}")
+                ).collect()[0]
+                self.logger.info(f"Stats for {col_name}: {stats}")
+        else:
+            self.logger.info("No numeric columns found.")
+
+    def _calculate_string_stats(self, df):
+        """
+        Calculate and log basic statistics for string columns.
+
+        Args:
+            df (DataFrame): The input DataFrame.
+
+        Statistics include:
+            - Approximate unique value count
+            - Null value count
+            - Maximum string length
+
+        Example Output:
+            unique_Name: 4, null_Name: 1, max_length_Name: 10
+        """
+        string_cols = [field.name for field in df.schema.fields if field.dataType.typeName() == 'string']
+        if string_cols:
+            self.logger.info("String Column Statistics:")
+            for col_name in string_cols:
+                stats = df.select(
+                    approx_count_distinct(col(col_name)).alias(f"unique_{col_name}"),
+                    count(when(col(col_name).isNull(), col(col_name))).alias(f"null_{col_name}"),
+                    max(length(col(col_name))).alias(f"max_length_{col_name}")
+                ).collect()[0]
+                self.logger.info(f"Stats for {col_name}: {stats}")
+        else:
+            self.logger.info("No string columns found.")
+
+    def _data_type_summary(self, df):
+        """
+        Summarize and log the types of data in the DataFrame.
+
+        Args:
+            df (DataFrame): The input DataFrame.
+
+        Example Output:
+            integer: 2 columns
+            string: 1 column
+        """
+        type_counts = {}
+        for field in df.schema.fields:
+            data_type = field.dataType.typeName()
+            type_counts[data_type] = type_counts.get(data_type, 0) + 1
+        self.logger.info("Data Type Summary:")
+        for data_type, count in type_counts.items():
+            self.logger.info(f"{data_type}: {count} columns")
+
+    def _output_sample_data(self, df, sample_size=5):
+        """
+        Output a random sample of rows from the DataFrame.
+
+        Args:
+            df (DataFrame): The input DataFrame.
+            sample_size (int): Number of rows to sample. Default is 5.
+
+        Example:
+            Sample Data:
+            +-----+-----+
+            | Name|  Age|
+            +-----+-----+
+            |Alice|   25|
+            +-----+-----+
+        """
+        self.logger.info("Sample Data:")
+        df.orderBy(rand()).limit(sample_size).show()
