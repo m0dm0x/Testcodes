@@ -1,59 +1,51 @@
-from pyspark.sql import SparkSession
+from edh_ingestion_modules.models.task import Task, TaskStatus
+from edh_ingestion_modules.utilities.logging_utility import EdhPySparkLogger
+from edh_ingestion_modules.utilities.task_snapshot_utility import TaskSnapshot
 from pyspark.sql.functions import (
     col, min, max, mean, stddev, count, approx_count_distinct, length, rand, when
 )
-from edh_pyspark_task import Task, TaskStatus
-from edh_pyspark_singleton import EdhPySparkSingleton
-from edh_pyspark_logger import EdhPySparkLogger
-from edh_task_snapshot import TaskSnapshot
+
 
 class GetMetricsTask(Task):
     """
-    GetMetricsTask is a PySpark task that analyzes and provides insights into input DataFrames, 
-    such as schema, row counts, basic statistics, and data sampling.
+    GetMetricsTask provides insights for input DataFrames, such as schema,
+    row counts, statistics, and Spark execution plans.
 
-    Configuration format example:
-        {
-            "taskId": "get_metrics_task",
-            "dfIds": ["df1", "df2"],
-            "display_head": True,
-            "count_rows": True,
-            "print_schema": True,
-            "numeric_stats": True,
-            "string_stats": True,
-            "data_type_summary": True,
-            "sample_data": True
-        }
+    Configuration example:
+    {
+        "taskId": "get_metrics_task",
+        "inputDataFrames": "input_df1,input_df2",
+        "display_head": "true",
+        "count_rows": "true",
+        "print_schema": "true",
+        "numeric_stats": "true",
+        "string_stats": "true",
+        "data_type_summary": "true",
+        "sample_data": "true",
+        "log_spark_plan": "true"
+    }
     """
 
     def __init__(self, config: dict):
-        """
-        Initialize the task with the provided configuration.
-
-        Args:
-            config (dict): Configuration dictionary containing task-specific settings.
-        """
         self.config = config
         self.task_id = config.get("taskId")
-        self.logger = EdhPySparkLogger.get_instance()
-        self.snapshots = TaskSnapshot.get_instance()
 
-    def _display_dataframe(self, df, num_rows=20):
-        self.logger.info("Displaying DataFrame head:")
+    def _display_dataframe(self, df, logger, num_rows=20):
+        logger.info("Displaying DataFrame head:")
         df.show(num_rows)
 
-    def _count_rows(self, df):
+    def _count_rows(self, df, logger):
         row_count = df.count()
-        self.logger.info(f"Total number of rows: {row_count}")
+        logger.info(f"Total number of rows: {row_count}")
 
-    def _print_schema(self, df):
-        self.logger.info("DataFrame Schema:")
+    def _print_schema(self, df, logger):
+        logger.info("DataFrame Schema:")
         df.printSchema()
 
-    def _calculate_numeric_stats(self, df):
+    def _calculate_numeric_stats(self, df, logger):
         numeric_cols = [field.name for field in df.schema.fields if field.dataType.typeName() in ('integer', 'double', 'float', 'long')]
         if numeric_cols:
-            self.logger.info("Numeric Column Statistics:")
+            logger.info("Numeric Column Statistics:")
             for col_name in numeric_cols:
                 stats = df.select(
                     min(col(col_name)).alias(f"min_{col_name}"),
@@ -63,36 +55,40 @@ class GetMetricsTask(Task):
                     count(col(col_name)).alias(f"non_null_{col_name}"),
                     count(when(col(col_name).isNull(), col_name)).alias(f"null_{col_name}")
                 ).collect()[0]
-                self.logger.info(f"Stats for {col_name}: {stats}")
+                logger.info(f"Stats for {col_name}: {stats}")
         else:
-            self.logger.info("No numeric columns found.")
+            logger.info("No numeric columns found.")
 
-    def _calculate_string_stats(self, df):
+    def _calculate_string_stats(self, df, logger):
         string_cols = [field.name for field in df.schema.fields if field.dataType.typeName() == 'string']
         if string_cols:
-            self.logger.info("String Column Statistics:")
+            logger.info("String Column Statistics:")
             for col_name in string_cols:
                 stats = df.select(
                     approx_count_distinct(col(col_name)).alias(f"unique_{col_name}"),
                     count(when(col(col_name).isNull(), col(col_name))).alias(f"null_{col_name}"),
                     max(length(col(col_name))).alias(f"max_length_{col_name}")
                 ).collect()[0]
-                self.logger.info(f"Stats for {col_name}: {stats}")
+                logger.info(f"Stats for {col_name}: {stats}")
         else:
-            self.logger.info("No string columns found.")
+            logger.info("No string columns found.")
 
-    def _data_type_summary(self, df):
+    def _data_type_summary(self, df, logger):
         type_counts = {}
         for field in df.schema.fields:
             data_type = field.dataType.typeName()
             type_counts[data_type] = type_counts.get(data_type, 0) + 1
-        self.logger.info("Data Type Summary:")
+        logger.info("Data Type Summary:")
         for data_type, count in type_counts.items():
-            self.logger.info(f"{data_type}: {count} columns")
+            logger.info(f"{data_type}: {count} columns")
 
-    def _output_sample_data(self, df, sample_size=5):
-        self.logger.info("Sample Data:")
+    def _output_sample_data(self, df, logger, sample_size=5):
+        logger.info("Sample Data:")
         df.orderBy(rand()).limit(sample_size).show()
+
+    def _log_spark_plan(self, df, logger):
+        logger.info("Execution Plan (Logical and Physical):")
+        df.explain(True)
 
     def execute(self):
         """
@@ -103,41 +99,47 @@ class GetMetricsTask(Task):
         """
         status = TaskStatus.SUCCESS, None
 
+        logger = EdhPySparkLogger.get_instance()
+        snapshots = TaskSnapshot.get_instance()
+
         try:
-            dataframe_ids = self.config.get("dfIds", [])
+            dataframe_ids = self.config.get("inputDataFrames", "").split(",")
 
             for df_id in dataframe_ids:
-                df = self.snapshots.get_snapshot(df_id)
+                df = snapshots.get_snapshot(df_id.strip())
                 if not df:
-                    self.logger.warning(f"No DataFrame found for id: {df_id}")
+                    logger.warning(f"No DataFrame found for id: {df_id}")
                     continue
 
-                self.logger.info(f"Processing DataFrame with ID: {df_id}")
+                logger.info(f"Processing DataFrame with ID: {df_id}")
 
                 # Execute operations based on task-level flags
-                if self.config.get("display_head", False):
-                    self._display_dataframe(df)
+                if self.config.get("display_head", "false").lower() == "true":
+                    self._display_dataframe(df, logger)
 
-                if self.config.get("count_rows", False):
-                    self._count_rows(df)
+                if self.config.get("count_rows", "false").lower() == "true":
+                    self._count_rows(df, logger)
 
-                if self.config.get("print_schema", False):
-                    self._print_schema(df)
+                if self.config.get("print_schema", "false").lower() == "true":
+                    self._print_schema(df, logger)
 
-                if self.config.get("numeric_stats", False):
-                    self._calculate_numeric_stats(df)
+                if self.config.get("numeric_stats", "false").lower() == "true":
+                    self._calculate_numeric_stats(df, logger)
 
-                if self.config.get("string_stats", False):
-                    self._calculate_string_stats(df)
+                if self.config.get("string_stats", "false").lower() == "true":
+                    self._calculate_string_stats(df, logger)
 
-                if self.config.get("data_type_summary", False):
-                    self._data_type_summary(df)
+                if self.config.get("data_type_summary", "false").lower() == "true":
+                    self._data_type_summary(df, logger)
 
-                if self.config.get("sample_data", False):
-                    self._output_sample_data(df)
+                if self.config.get("sample_data", "false").lower() == "true":
+                    self._output_sample_data(df, logger)
+
+                if self.config.get("log_spark_plan", "false").lower() == "true":
+                    self._log_spark_plan(df, logger)
 
         except Exception as e:
-            self.logger.error(f"Task execution failed with error: {e}")
+            logger.error(f"Task execution failed with error: {e}")
             status = TaskStatus.FAILED, str(e)
 
         return status
