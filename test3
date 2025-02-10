@@ -105,3 +105,23 @@ class CSVService:
         except Exception as e:
             logger.error(f"CSV workflow failed: {str(e)}", exc_info=True)
             raise
+
+
+
+{
+  "input_path": "gs://your-bucket-name/input-data.csv",
+  "output_path": "gs://your-bucket-name/output-data",
+  "header": "true",
+  "delimiter": ",",
+  "quote": "\"",
+  "escape": "\\",
+  "nullValue": "",
+  "emptyValue": "",
+  "comment": "",
+  "ignoreLeadingWhiteSpace": "false",
+  "ignoreTrailingWhiteSpace": "false",
+  "compression": "gzip",
+  "mode": "overwrite",
+  "quoteAll": "false",
+  "partition_by": ["column1", "column2"]
+}
