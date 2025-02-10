@@ -1,86 +1,107 @@
-from typing import Tuple, Optional, Union
-from pyspark.sql import SparkSession, DataFrame
-from edh_logger import EdhPysparkLogger  # Assuming EdhPysparkLogger is part of your project
-from task_snapshot import TaskSnapshot  # Assuming TaskSnapshot is part of your project
-from task_status import TaskStatus  # Enum for task execution status
-from task import Task  # Abstract base class for all tasks
+from pyspark.sql import DataFrame
+from pyspark.sql.types import StructType
+from edh_ingestion_modules.utilities.spark_utility import EdhPySparkSingleton
+from edh_ingestion_modules.utilities.gcs_utility import GCSClientSingleton
 
 
-class TransformationTask(Task):
-    """
-    Task for applying SQL transformations on input DataFrames.
-    Inherits from the abstract Task class.
-    """
+class CSVService:
+    def read_csv_from_gcs(self, spark, config, logger, schema: StructType = None) -> DataFrame:
+        """Read CSV data from GCS with configurable options."""
+        input_path = config.get("input_path")
+        if not input_path.startswith("gs://"):
+            raise ValueError("Input path must be a valid GCS path (starting with 'gs://')")
 
-    def __init__(self, config: dict):
-        """
-        Initialize the TransformationTask with the given configuration.
-
-        Args:
-            config (dict): Configuration for the task, including paths, SQL files, etc.
-        """
-        super().__init__(config)
-        self.sql_file_path = self.config.get("sqlFile")
-        self.delimiter = self.config.get("delimiter", ",")
-        self.continue_on_missing = self.config.get("continueOnMissing", False)
-
-    def execute(self) -> Tuple[TaskStatus, Optional[Union[Exception, str]]]:
-        """
-        Execute the transformation task.
-
-        Returns:
-            Tuple[TaskStatus, Optional[Union[Exception, str]]]: Execution status and any error description.
-        """
         try:
-            # Validate input DataFrames
-            input_dataframes = self.config["inputDataFrame"].split(self.delimiter)
-            output_dataframe = self.config["outputDataFrame"]
-            all_exist = all(
-                self.snapshot_instance.get_snapshot(df) is not None for df in input_dataframes
-            )
+            logger.info(f"Reading CSV from GCS: {input_path}")
+            reader = spark.read.format("csv")
 
-            if not all_exist and not self.continue_on_missing:
-                raise ValueError("Some input DataFrames are missing and continueOnMissing is False.")
+            # Set CSV options from config with defaults
+            options = {
+                "header": config.get("header", "true"),
+                "inferSchema": "false" if schema else "true",
+                "delimiter": config.get("delimiter", ","),
+                "quote": config.get("quote", '"'),
+                "escape": config.get("escape", "\\"),
+                "nullValue": config.get("nullValue", ""),
+                "emptyValue": config.get("emptyValue", ""),
+                "comment": config.get("comment", ""),
+                "ignoreLeadingWhiteSpace": config.get("ignoreLeadingWhiteSpace", "false"),
+                "ignoreTrailingWhiteSpace": config.get("ignoreTrailingWhiteSpace", "false")
+            }
 
-            # Register input DataFrames as temporary views
-            for df_id in input_dataframes:
-                df = self.snapshot_instance.require_snapshot(df_id)
-                df.createOrReplaceTempView(df_id)
+            for key, value in options.items():
+                reader = reader.option(key, value)
 
-            # Read and execute the SQL transformation
-            sql_query = self._read_sql_file(self.sql_file_path)
-            transformed_df = self.spark_instance.sql(sql_query)
+            if schema:
+                reader = reader.schema(schema)
 
-            # Add transformed DataFrame to the snapshot
-            self.snapshot_instance.add_snapshot(output_dataframe, transformed_df)
+            if compression := config.get("compression"):
+                reader = reader.option("compression", compression)
 
-            self.logger_instance.info(f"TransformationTask completed successfully for {output_dataframe}.")
-            return TaskStatus.SUCCESS, None
+            return reader.load(input_path)
 
         except Exception as e:
-            error_message = f"Error in TransformationTask: {str(e)}"
-            self.logger_instance.error(error_message)
-            return TaskStatus.FAILED, error_message
+            logger.error(f"CSV read failed: {str(e)}", exc_info=True)
+            raise RuntimeError(f"CSV read operation failed: {e}") from e
 
-    def is_executable(self) -> bool:
-        """
-        Determine if the task is executable based on the current context.
-        
-        Returns:
-            bool: True if the task can be executed, False otherwise.
-        """
-        return self.snapshot_instance.status != TaskStatus.FAILED
+    def write_csv_to_gcs(self, df: DataFrame, config, logger) -> None:
+        """Write DataFrame to GCS as CSV with configurable options."""
+        output_path = config.get("output_path")
+        if not output_path.startswith("gs://"):
+            raise ValueError("Output path must be a valid GCS path (starting with 'gs://')")
 
-    @staticmethod
-    def _read_sql_file(file_path: str) -> str:
-        """
-        Read the SQL query from the specified file.
+        try:
+            logger.info(f"Writing CSV to GCS: {output_path}")
+            writer = df.write.format("csv")
 
-        Args:
-            file_path (str): Path to the SQL file.
+            # Set CSV options from config with defaults
+            options = {
+                "header": config.get("header", "true"),
+                "delimiter": config.get("delimiter", ","),
+                "quote": config.get("quote", '"'),
+                "escape": config.get("escape", "\\"),
+                "nullValue": config.get("nullValue", ""),
+                "quoteAll": config.get("quoteAll", "false")
+            }
 
-        Returns:
-            str: SQL query.
-        """
-        with open(file_path, "r") as file:
-            return file.read()
+            for key, value in options.items():
+                writer = writer.option(key, value)
+
+            if compression := config.get("compression"):
+                writer = writer.option("compression", compression)
+
+            # Handle write mode
+            mode = config.get("mode", "overwrite")
+            valid_modes = ["overwrite", "append", "ignore", "error", "errorifexists"]
+            if mode.lower() not in valid_modes:
+                raise ValueError(f"Invalid write mode: {mode}. Valid modes: {', '.join(valid_modes)}")
+
+            writer = writer.mode(mode)
+
+            # Handle partitioning
+            partition_cols = config.get("partition_by")
+            if partition_cols:
+                writer = writer.partitionBy(*partition_cols)
+
+            writer.save(output_path)
+            logger.info(f"Successfully wrote CSV to {output_path}")
+
+        except Exception as e:
+            logger.error(f"CSV write failed: {str(e)}", exc_info=True)
+            raise RuntimeError(f"CSV write operation failed: {e}") from e
+
+    def execute(self) -> None:
+        """Execute complete read-write workflow."""
+        try:
+            spark = EdhPySparkSingleton.get_instance()
+            config = EdhPySparkSingleton.get_config()
+            logger = EdhPySparkSingleton.get_logger()
+
+            logger.info("Starting CSV processing workflow")
+            df = self.read_csv_from_gcs(spark, config, logger)
+            self.write_csv_to_gcs(df, config, logger)
+            logger.info("CSV processing completed successfully")
+
+        except Exception as e:
+            logger.error(f"CSV workflow failed: {str(e)}", exc_info=True)
+            raise
